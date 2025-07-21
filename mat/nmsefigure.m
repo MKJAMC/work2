@@ -5,14 +5,14 @@ clc;        % 清除命令窗口
 close all;  % 关闭所有已打开的图形窗口
 
 %% --- 2. 定义文件和参数 ---
-SNR_dB = 0:5:15;
+SNR_dB = 0:5:25;
 
 % 将您的三个 .mat 文件名存储在一个元胞数组 (cell array) 中
-matFiles = {'first_snr_15.mat', 'second_snr_15.mat', 'third_1.mat','third_0.75.mat','third_0.5.mat'};
+matFiles = {'1.mat', '2.mat', 'third_1.mat','third_0.75.mat','third_0.5.mat','third_0.25'};
 
 % 为每个数据集定义图例中显示的标签
-legendLabels = {'方案1', '方案2', '方案3,{1}','方案三,{0.75}','方案三,{0.5}'};
-markerStyles = {'-o', '-s', '-^','-square','-*'}; 
+legendLabels = {'方案1', '方案2', '方案3,{1}','方案三,{0.75}','方案三,{0.5}','方案三,{0.25}'};
+markerStyles = {'-o', '--*', '-s','-square','-s','-s'}; 
 % --- 3. 创建图形并准备绘图 ---
 figure;  % 创建一个新的图形窗口
 hold on; % 允许在同一张图上绘制多条曲线
@@ -59,7 +59,7 @@ hold off; % 绘制完成，结束保持图形状态
 title('不同方案下的NMSE');
 
 % 添加 x 轴和 y 轴的标签
-xlabel('SNR_{d}(dB)');
+xlabel('SNR(dB)');
 ylabel('NMSE ');
 % 显示图例。'DisplayName' 已在 plot 函数中设置好了。
 % 'Location', 'northeast' 表示图例显示在右上角，您也可以改为 'best' 让MATLAB自动选择最佳位置。

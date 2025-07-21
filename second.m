@@ -11,12 +11,12 @@ ans2=(M-2*l_max-1)*N+(N-2*k_max-1)*(2*l_max+1);
 bit= ans2*log2(modu);
 
 %% 信道检测
-% SNR_dB = 0:5:15;
-% iter=[2000,2000,2000,2000];%迭代次数
+SNR_dB = 0:5:25;
+iter=[2000,2000,2000,2000,2000,2000];%迭代次数
 
 %% 符号检测SNR
-SNR_dB=20;
-iter=[4e6];
+% SNR_dB=20;
+% iter=[4e6];
 
 ber = zeros(1, length(SNR_dB));
 chanel_err=zeros(1,length(SNR_dB));
@@ -27,10 +27,10 @@ for i_snr=1:length(SNR_dB)
     nums=0;
     total_bits_transmitted = 0;%传输bit
     total_bit_errors = 0;%错误bit
-    % for nums=1:iter(i_snr)%每次都重新生成信道
-    %     nums
-    while  (nums*bit )<iter(i_snr)
-        nums = nums + 1; % 迭代次数加1
+    for nums=1:iter(i_snr)%每次都重新生成信道
+        nums
+    % while  (nums*bit )<iter(i_snr)
+    %     nums = nums + 1; % 迭代次数加1
         li = randperm(l_max, P)';
         k = randi([-k_max,k_max],P,1);kv=randi([-5,5],P,1)*0.1;ki=k+kv;
         % EVA信道，时延为0的路径是增益最大的，以后依次递减
@@ -52,8 +52,7 @@ for i_snr=1:length(SNR_dB)
 
         % 方案二的功率消减
         dd=dd.*sqrt(SNR/ans2);
-        % 速率
-
+        
         %保护间隔
         for i=1:l_max+1
             for j=1:2*k_max+1
@@ -177,87 +176,87 @@ for i_snr=1:length(SNR_dB)
         nmse(nums) = num / den;
 
         %% H_eff等效信道
-        y_vec = reshape(Y, M*N, 1);
-        dd_vec = reshape(dd, M*N, 1);
-        H_eff = zeros(M*N, M*N);
-        for l = 0:M-1       % 遍历矩阵的行
-            for k = 0:N-1   % 遍历矩阵的列
-                % 计算 Y(l+1, k+1) 在列主序向量 y_vec 中的索引
-                row_idx = k*M + (l+1);
-                for l_prime = 0:M-1
-                    for k_prime = 0:N-1
-                        % 计算 dd(l_prime+1, k_prime+1) 在列主序向量 dd_vec 中的索引
-                        col_idx = k_prime*M + (l_prime+1);
-                        h_l = mod(l - l_prime, M);
-                        h_k = mod(k - k_prime, N);
-                        H_eff(row_idx, col_idx) = hw_est(h_l + 1, h_k + 1);
-                    end
-                end
-            end
-        end
-        y=H_eff*dd_vec;
-        yabs=reshape(abs(y),M,[]);
-        %% --- 导频干扰消除 (PIC) ---
-
-        % 步骤 1: 重建一个只包含导频的发送矩阵
-        % 创建一个全零矩阵，只在导频位置(1,1)放置导频值Xp
-        dd_pilot_only = zeros(M, N);
-        dd_pilot_only(1, 1) = Xp;
-
-        % 步骤 2: 估计导频部分对接收信号的贡献
-        % 通过将纯导频信号与我们估计的信道hw_est进行二维循环卷积
-        % 使用高效的FFT方法来完成这个卷积
-        Y_pilot_est = ifft2(fft2(dd_pilot_only) .* fft2(hw_est));
-
-        % 步骤 3: 从总接收信号中减去估计的导频影响
-        % Y_data_only 就是消除了导频干扰后，留给数据检测器处理的信号
-        Y_data_only = Y - Y_pilot_est;
-
-
-        %% MMSE 检测 (高效频域法)
-        H_lmmse = (H_eff' * H_eff + 1 * eye(size(H_eff, 2))) \ H_eff';
-        dd_est_matrix=H_lmmse*Y_data_only(:);
-        dd_est_matrix= reshape(dd_est_matrix, M, []);
-
-        % --- 步骤 5: 提取数据符号并解调 ---
-        % 找到原始数据符号的位置 (排除保护带的0和导频Xp)
-        data_indices = find(dd ~= 0 & dd ~= Xp);
-
-        % 提取对应位置的恢复符号
-        dd_est_vec = dd_est_matrix(data_indices);
-        dd_vec=dd(data_indices);
-        t1=abs(dd_est_vec);t2=abs(dd_vec);
-
-        dd_est_vec=dd_est_vec./sqrt(SNR/ans2);
-        % 提取原始发送的比特 (用于比较)
-        bit_orig = bit_all(data_indices);
-
-        % 解调恢复的符号，得到估计的比特
-        bit_est = qamdemod(dd_est_vec, modu, 'UnitAveragePower', true);
-
-        % --- 步骤 6: 计算本次迭代的比特误码率 (BER) ---
-        [num_errors, ber_iter(nums)] = biterr(bit_orig, bit_est);
-
-        [num_errors_this_frame, ~] = biterr(bit_orig(:), bit_est(:));
-        num_bits_this_frame = length(bit_orig(:));
-        total_bit_errors = total_bit_errors + num_errors_this_frame;
-        total_bits_transmitted = total_bits_transmitted + num_bits_this_frame;
-        if mod(nums, 50) == 0 % 每50次迭代打印一次状态
-            fprintf('SNR: %.1f dB | Iter: %d | Total Errors: %d | Current BER: %e\n', ...
-                SNR_dB(i_snr), nums, total_bit_errors, total_bit_errors/total_bits_transmitted);
-        end
+        % y_vec = reshape(Y, M*N, 1);
+        % dd_vec = reshape(dd, M*N, 1);
+        % H_eff = zeros(M*N, M*N);
+        % for l = 0:M-1       % 遍历矩阵的行
+        %     for k = 0:N-1   % 遍历矩阵的列
+        %         % 计算 Y(l+1, k+1) 在列主序向量 y_vec 中的索引
+        %         row_idx = k*M + (l+1);
+        %         for l_prime = 0:M-1
+        %             for k_prime = 0:N-1
+        %                 % 计算 dd(l_prime+1, k_prime+1) 在列主序向量 dd_vec 中的索引
+        %                 col_idx = k_prime*M + (l_prime+1);
+        %                 h_l = mod(l - l_prime, M);
+        %                 h_k = mod(k - k_prime, N);
+        %                 H_eff(row_idx, col_idx) = hw_est(h_l + 1, h_k + 1);
+        %             end
+        %         end
+        %     end
+        % end
+        % y=H_eff*dd_vec;
+        % yabs=reshape(abs(y),M,[]);
+        % %% --- 导频干扰消除 (PIC) ---
+        % 
+        % % 步骤 1: 重建一个只包含导频的发送矩阵
+        % % 创建一个全零矩阵，只在导频位置(1,1)放置导频值Xp
+        % dd_pilot_only = zeros(M, N);
+        % dd_pilot_only(1, 1) = Xp;
+        % 
+        % % 步骤 2: 估计导频部分对接收信号的贡献
+        % % 通过将纯导频信号与我们估计的信道hw_est进行二维循环卷积
+        % % 使用高效的FFT方法来完成这个卷积
+        % Y_pilot_est = ifft2(fft2(dd_pilot_only) .* fft2(hw_est));
+        % 
+        % % 步骤 3: 从总接收信号中减去估计的导频影响
+        % % Y_data_only 就是消除了导频干扰后，留给数据检测器处理的信号
+        % Y_data_only = Y - Y_pilot_est;
+        % 
+        % 
+        % %% MMSE 检测 (高效频域法)
+        % H_lmmse = (H_eff' * H_eff + 1 * eye(size(H_eff, 2))) \ H_eff';
+        % dd_est_matrix=H_lmmse*Y_data_only(:);
+        % dd_est_matrix= reshape(dd_est_matrix, M, []);
+        % 
+        % % --- 步骤 5: 提取数据符号并解调 ---
+        % % 找到原始数据符号的位置 (排除保护带的0和导频Xp)
+        % data_indices = find(dd ~= 0 & dd ~= Xp);
+        % 
+        % % 提取对应位置的恢复符号
+        % dd_est_vec = dd_est_matrix(data_indices);
+        % dd_vec=dd(data_indices);
+        % t1=abs(dd_est_vec);t2=abs(dd_vec);
+        % 
+        % dd_est_vec=dd_est_vec./sqrt(SNR/ans2);
+        % % 提取原始发送的比特 (用于比较)
+        % bit_orig = bit_all(data_indices);
+        % 
+        % % 解调恢复的符号，得到估计的比特
+        % bit_est = qamdemod(dd_est_vec, modu, 'UnitAveragePower', true);
+        % 
+        % % --- 步骤 6: 计算本次迭代的比特误码率 (BER) ---
+        % [num_errors, ber_iter(nums)] = biterr(bit_orig, bit_est);
+        % 
+        % [num_errors_this_frame, ~] = biterr(bit_orig(:), bit_est(:));
+        % num_bits_this_frame = length(bit_orig(:));
+        % total_bit_errors = total_bit_errors + num_errors_this_frame;
+        % total_bits_transmitted = total_bits_transmitted + num_bits_this_frame;
+        % if mod(nums, 50) == 0 % 每50次迭代打印一次状态
+        %     fprintf('SNR: %.1f dB | Iter: %d | Total Errors: %d | Current BER: %e\n', ...
+        %         SNR_dB(i_snr), nums, total_bit_errors, total_bit_errors/total_bits_transmitted);
+        % end
     end
     chanel_err(i_snr)=mean(nmse);
-    ber(i_snr) = total_bit_errors / total_bits_transmitted;;
+    % ber(i_snr) = total_bit_errors / total_bits_transmitted;;
 end
-% figure();% plot(SNR_dB,chanel_err);
-% semilogy(SNR_dB,chanel_err);
-% grid on;
-%
-figure;
-semilogy(SNR_dB, ber, 'rs-', 'LineWidth', 2, 'MarkerSize', 8);
+figure();% plot(SNR_dB,chanel_err);
+semilogy(SNR_dB,chanel_err);
 grid on;
-xlabel('信噪比 (dB)');ylabel('比特误码率 (BER)');title('MMSE检测后系统BER性能曲线');legend('MMSE-BER');
+%
+% figure;
+% semilogy(SNR_dB, ber, 'rs-', 'LineWidth', 2, 'MarkerSize', 8);
+grid on;
+% xlabel('信噪比 (dB)');ylabel('比特误码率 (BER)');title('MMSE检测后系统BER性能曲线');legend('MMSE-BER');
 
 function output = zeta_N(k, N)
 %这个函数属于输入一个k，得到一个数值

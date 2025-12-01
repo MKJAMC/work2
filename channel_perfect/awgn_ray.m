@@ -298,33 +298,167 @@
 % legend('理论AWGN', '理论瑞利 (近似)', '仿真QPSK (瑞利)');
 % axis([min(SNR_dB_range) max(SNR_dB_range) 1e-5 1]);
 
-% 1. EVA信道模型的相对功率 (dB) 
-relative_power_dB = [0.0, -1.5, -1.4, -3.6, -0.6, -9.1, -7.0, -12.0, -16.9];
+% % 1. EVA信道模型的相对功率 (dB) 
+% relative_power_dB = [0.0, -1.5, -1.4, -3.6, -0.6, -9.1, -7.0, -12.0, -16.9];
+% 
+% % 步骤一: 将dB转换为线性值
+% relative_power_linear = 10.^(relative_power_dB / 10);
+% 
+% % 步骤二: 功率归一化
+% total_power = sum(relative_power_linear);
+% normalized_variances = relative_power_linear / total_power;%计算每个系数的百分比
+% 
+% % 检查：所有方差之和应约等于1
+% disp(['总归一化功率: ', num2str(sum(normalized_variances))]);
+% 
+% % `normalized_variances` 这个数组现在包含了每条路径的方差 sigma_i^2
+% % 可以在仿真循环中用来生成 h_i
+% disp('每条路径的归一化方差 (sigma_i^2):');
+% disp(normalized_variances);
+% 
+% % 步骤三: 在仿真循环中生成随机信道增益的示例
+% num_paths = length(normalized_variances);
+% h = zeros(1, num_paths); % 存储当前时刻的信道增益
+% 
+% for i = 1:num_paths
+%     sigma2_i = normalized_variances(i);
+%     % 生成一个随机的信道增益
+%     h(i) = sqrt(sigma2_i / 2) * (randn() + 1j * randn());
+% end
+% 
+% disp('一次仿真迭代生成的随机信道增益 h_i:');
+% disp(h);
 
-% 步骤一: 将dB转换为线性值
-relative_power_linear = 10.^(relative_power_dB / 10);
+clc; clear; close all;
 
-% 步骤二: 功率归一化
-total_power = sum(relative_power_linear);
-normalized_variances = relative_power_linear / total_power;%计算每个系数的百分比
+%% 1. 定义一个块循环矩阵的生成元
+M = 4;
+N = 3;
 
-% 检查：所有方差之和应约等于1
-disp(['总归一化功率: ', num2str(sum(normalized_variances))]);
+% hw 就像您OTFS场景中的时延-多普勒信道响应矩阵
+% 整个 (MN)x(MN) 的 H_eff 矩阵完全由这一个 M x N 的 hw 矩阵定义
+hw = randn(M, N) + 1i * randn(M, N);
+disp('块循环矩阵的生成元 hw (M x N):');
+disp(hw);
 
-% `normalized_variances` 这个数组现在包含了每条路径的方差 sigma_i^2
-% 可以在仿真循环中用来生成 h_i
-disp('每条路径的归一化方差 (sigma_i^2):');
-disp(normalized_variances);
+% 定义一个随机输入信号 dd
+dd = randn(M, N) + 1i * randn(M, N);
 
-% 步骤三: 在仿真循环中生成随机信道增益的示例
-num_paths = length(normalized_variances);
-h = zeros(1, num_paths); % 存储当前时刻的信道增益
+%% 2. 慢速方法：显式构建 H_eff 并做矩阵乘法
 
-for i = 1:num_paths
-    sigma2_i = normalized_variances(i);
-    % 生成一个随机的信道增益
-    h(i) = sqrt(sigma2_i / 2) * (randn() + 1j * randn());
+% 显式构建块循环矩阵 H_eff (计算量巨大)
+H_eff = zeros(M*N, M*N);
+for i = 0:N-1
+    for j = 0:M-1
+        row_idx = i*M + j + 1;
+        for p = 0:N-1
+            for q = 0:M-1
+                col_idx = p*M + q + 1;
+                % 计算循环移位后的索引
+                h_row = mod(j - q, M);
+                h_col = mod(i - p, N);
+                H_eff(row_idx, col_idx) = hw(h_row + 1, h_col + 1);
+            end
+        end
+    end
 end
 
-disp('一次仿真迭代生成的随机信道增益 h_i:');
-disp(h);
+% 将输入信号向量化
+dd_vec = dd(:); 
+% 矩阵-向量 乘法
+y_vec_slow = H_eff * dd_vec;
+% 将输出结果变回 M x N 矩阵
+y_slow = reshape(y_vec_slow, M, N);
+
+disp('慢速方法 (矩阵乘法) 的输出结果 y_slow:');
+disp(y_slow);
+
+
+% %% 3. 快速方法：利用 2D-FFT 进行对角化（频域相乘）
+% 
+% % 步骤 A: 对生成元 hw 做二维傅里叶变换，得到“特征值”
+% % H_freq 这个 M x N 矩阵可以看作是 H_eff 对角化后
+% % 那个巨大的对角矩阵 Lambda 的一种紧凑表示形式
+% H_freq = fft2(hw);
+% 
+% % 步骤 B: 对输入 dd 做二维傅里叶变换
+% dd_freq = fft2(dd);
+% 
+% % 步骤 C: 在频域进行逐元素相乘 (这步等效于 H_eff * dd_vec)
+% y_freq = H_freq .* dd_freq;
+% 
+% % 步骤 D: 将结果通过二维逆傅里叶变换返回到原始域
+% y_fast = ifft2(y_freq);
+% 
+% disp('快速方法 (2D-FFT) 的输出结果 y_fast:');
+% disp(y_fast);
+% 
+% %% 4. 验证两种方法结果是否一致
+% diff_2d = max(abs(y_slow - y_fast), [], 'all');
+% fprintf('\n慢速方法与快速方法结果的最大误差为: %e\n', diff_2d);
+% 
+% if diff_2d < 1e-10
+%     disp('验证成功！块循环矩阵的2D-FFT对角化正确。');
+%     disp('这证明了在OTFS中，使用fft2进行信道均衡是等效且高效的。');
+% else
+%     disp('验证失败！');
+% end
+
+clc; clear; close all;
+
+%% 定义一个小尺寸的例子
+M = 3;
+N = 2;
+hw = randn(M, N) + 1i*randn(M, N); % 随机生成一个hw
+
+%% 慢速但绝对正确的方法：构建H_eff并用eig()求解
+% 这一步仅为验证，实际中绝不会这么做
+H_eff = zeros(M*N, M*N);
+for i = 0:N-1
+    for j = 0:M-1
+        row_idx = i*M + j + 1;
+        for p = 0:N-1
+            for q = 0:M-1
+                col_idx = p*M + q + 1;
+                h_row = mod(j - q, M);
+                h_col = mod(i - p, N);
+                H_eff(row_idx, col_idx) = hw(h_row + 1, h_col + 1);
+            end
+        end
+    end
+end
+
+% 方法1：标准方法求特征值
+lambda_true = eig(H_eff);
+% 对特征值进行排序，以便比较
+% lambda_true_sorted = sort(lambda_true);
+
+
+%% 比较两种快速计算方法
+% 方法2：您提出的错误方法 (1D FFT)
+% lambda_incorrect = fft(hw(:));
+% lambda_incorrect_sorted = sort(lambda_incorrect);
+
+% 方法3：正确的快速方法 (2D FFT)
+H_freq = fft2(hw);
+lambda_correct = H_freq(:); % 将结果向量化以便比较
+% lambda_correct_sorted = sort(lambda_correct);
+
+
+%% 结果对比
+fprintf('--- 特征值对比 ---\n\n');
+disp('   标准eig()结果     |    错误fft(hw(:))     |    正确fft2(hw)');
+disp([lambda_true_sorted, lambda_incorrect_sorted, lambda_correct_sorted]);
+
+% 验证误差
+error_incorrect = max(abs(lambda_true_sorted - lambda_incorrect_sorted));
+error_correct = max(abs(lambda_true_sorted - lambda_correct_sorted));
+
+fprintf('\n错误方法(fft)与真实值的最大误差: %e\n', error_incorrect);
+fprintf('正确方法(fft2)与真实值的最大误差: %e\n', error_correct);
+
+if error_correct < 1e-10
+    fprintf('\n结论：fft2(hw) 能够正确计算出 H_eff 的特征值！\n');
+else
+    fprintf('\n结论：验证失败！\n');
+end

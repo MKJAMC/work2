@@ -1,5 +1,5 @@
 clc;clear;close all;
-
+% 方案三IM原始检测方案，直接使用最大位置作为检测
 M=64;
 N=32;
 fc=64e9;delta_f=120e3;
@@ -9,19 +9,18 @@ delay=[30,150,310,370,710,1090,1730,2510]*1e-9;
 delay_tap0=delay*M*delta_f;
 li=round(delay_tap0);
 doppler_max=fc*u_max/c;
-theta0= -pi + 2*pi*rand(1, length(delay));
-doppler=doppler_max*cos(theta0) ;
-ki=doppler*N*(1/delta_f);
+
 k_max0=doppler_max*N*(1/delta_f);
 % EVA信道，时延为0的路径是增益最大的，以后依次递减
 h_p_db=[1.5,1.4,3.6,0.6,9.1,7,12,16.9];
 relative_power_linear = 10.^((-1) * h_p_db/10);%db转换为功率
 total_power = sum(relative_power_linear);
 h_p = relative_power_linear / total_power;%每一个增益所占据的百分比
-h_exp=exp( 1j*2 * pi * rand(1, length(h_p_db)));
+
 
 l_max=20;k_max=2;
 P=length(delay);%路径数
+
 cen_modu = 2;
 guard_modu= 4;
 bits_per_qam_symbol = log2(cen_modu);
@@ -42,18 +41,19 @@ bit=(log2(cen_modu)+log2(nchoosek(g,1)))*(cen_num)+(2*l_max+1)*bit_row;
 %% 符号检测SNR
 SNR=10:2:16;
 iter=[4e4,4e4,4e5,4e5];
-% SNR=18:2:20;iter=[4e5,4e6];
+% SNR=18;iter=[4e6];
 power_persym=10.^(SNR/10);%每个符号的功率
 ans2=(M-2*l_max-1)*N+(N-4*k_max-1)*(2*l_max+1);
 power=power_persym*ans2;%ans2为基准，求得总功率，方案二的功率为1
 ber = zeros(1, length(SNR));
-factor=power/ans3;
+factor=power/ans3;%平均每个符号的功率
 
 for i_snr=1:length(SNR)
     ber_iter = zeros(1, iter(i_snr));%一个frame错误bit数
     num_frames =ceil(iter(i_snr)/bit);
     frame_im_errors = zeros(1, num_frames);
     frame_qam_errors = zeros(1, num_frames);
+    frame_cen_im_err=zeros(1, num_frames); frame_guard_im_err=zeros(1, num_frames);
     frame_errors = zeros(1, num_frames);
     frame_bits = zeros(1, num_frames);
     %% 功率分配
@@ -79,7 +79,12 @@ for i_snr=1:length(SNR)
     for f=1:num_frames
         disp(f)
         original_im_bits = [];        original_qam_bits = [];
-        %%  发射端：基于信息比特生成OTFS-IM信号
+        % 信道生成
+        theta0= -pi + 2*pi*rand(1, length(delay));
+        doppler=doppler_max*cos(theta0) ;
+        ki=doppler*N*(1/delta_f);
+        h_exp=exp( 1j*2 * pi * rand(1, length(h_p_db)));
+        %  发射端：基于信息比特生成OTFS-IM信号
         dd = zeros(M, N);
         original_bits_stream = [];
         data_rows = (l_max + 2):(M - l_max);
@@ -93,7 +98,10 @@ for i_snr=1:length(SNR)
                 qam_bits = randi([0 1], 1, bits_per_qam_symbol);%生成一个qam符号的bit
                 original_bits_stream = [original_bits_stream, im_bits, qam_bits];
 
-                original_im_bits = [original_im_bits, im_bits];                original_qam_bits = [original_qam_bits, qam_bits];
+                original_im_bits = [original_im_bits, im_bits];
+                cen_im_num=length(original_im_bits);
+                original_qam_bits = [original_qam_bits, qam_bits];
+              
 
                 active_local_idx = bi2de(im_bits, 'left-msb') + 1;%将IM的bit转为位置
                 symbol_int = bi2de(qam_bits, 'left-msb');
@@ -145,9 +153,6 @@ for i_snr=1:length(SNR)
 
         ans3 = nnz(dd);%总激活个数
 
-
-       
-
         % 3.5 将不同的缩放因子应用到dd矩阵的不同区域
         % 注意：此时dd中的激活符号幅度还是1
         dd(data_rows,:) = dd(data_rows,:)* scale_central;
@@ -156,7 +161,7 @@ for i_snr=1:length(SNR)
 
 
         % 分数多普勒域下，DD域等效信道代码,发送数据和接受数据都是dd域
-        hw=zeros(M,N);Y=zeros(M,N);
+        hw=zeros(M,N);
         for l=0:M-1
             for k=0:N-1
                 for i=1:P
@@ -166,49 +171,64 @@ for i_snr=1:length(SNR)
                 end
             end
         end
+        hwabs=abs(hw);
 
-    
 
         %% H_eff等效信道
-        y_vec = reshape(Y, M*N, 1);
-        dd_vec = reshape(dd, M*N, 1);
-        H_eff = zeros(M*N, M*N);
-        for l = 0:M-1       % 遍历矩阵的行
-            for k = 0:N-1   % 遍历矩阵的列
-                % 计算 Y(l+1, k+1) 在列主序向量 y_vec 中的索引
-                row_idx = k*M + (l+1);
-                for l_prime = 0:M-1
-                    for k_prime = 0:N-1
-                        % 计算 dd(l_prime+1, k_prime+1) 在列主序向量 dd_vec 中的索引
-                        col_idx = k_prime*M + (l_prime+1);
-                        h_l = mod(l - l_prime, M);
-                        h_k = mod(k - k_prime, N);
-                        H_eff(row_idx, col_idx) = hw(h_l + 1, h_k + 1);
-                    end
-                end
-            end
-        end
+        % y_vec = reshape(zeros(M,N), M*N, 1);
+        % dd_vec = reshape(dd, M*N, 1);
+        % H_eff = zeros(M*N, M*N);
+        % for l = 0:M-1       % 遍历矩阵的行
+        %     for k = 0:N-1   % 遍历矩阵的列
+        %         % 计算 Y(l+1, k+1) 在列主序向量 y_vec 中的索引
+        %         row_idx = k*M + (l+1);
+        %         for l_prime = 0:M-1
+        %             for k_prime = 0:N-1
+        %                 % 计算 dd(l_prime+1, k_prime+1) 在列主序向量 dd_vec 中的索引
+        %                 col_idx = k_prime*M + (l_prime+1);
+        %                 h_l = mod(l - l_prime, M);
+        %                 h_k = mod(k - k_prime, N);
+        %                 H_eff(row_idx, col_idx) = hw(h_l + 1, h_k + 1);
+        %             end
+        %         end
+        %     end
+        % end
+        %  y0=H_eff*dd_vec;
+
+        % 频域相乘
+        H_freq = fft2(hw);
+        % 步骤 B: 对输入 dd 做二维傅里叶变换
+        dd_freq = fft2(dd);
+        % 步骤 C: 在频域进行逐元素相乘 (这步等效于 H_eff * dd_vec)
+        y_freq = H_freq .* dd_freq;
+        % 步骤 D: 将结果通过二维逆傅里叶变换返回到原始域
+        y = ifft2(y_freq);
+
+       
         %% 添加噪声
         noise=sqrt(1/2)*(randn(M*N,1)+1i*randn(M*N,1));%均值为0方差为1的高斯噪声
-        y=H_eff*dd_vec+noise;
-       
-      
-        % MMSE 检测 
-        heff=H_eff';
-        Ie=eye(size(H_eff, 2));
-        H_lmmse=(heff*((H_eff*heff+(1/factor(i_snr))*Ie))^(-1));%平均snr每个符号的
-        dd_est_matrix=H_lmmse*y;
-        dd_est_matrix= reshape(dd_est_matrix, M, []);
+        y=reshape(y,[],1)+noise;
+
+        %% MMSE 检测
+        % heff=H_eff';
+        % Ie=eye(size(H_eff, 2));
+        % H_lmmse=(heff*((H_eff*heff+(1/factor(i_snr))*Ie))^(-1));%平均snr每个符号的
+        % dd_est_matrix0=reshape(H_lmmse*y,M,N);
+
+        y_freq = fft2(reshape(y,M,N));
+        H_mmse_freq = conj(H_freq) ./ (abs(H_freq).^2 + 1/factor(i_snr));
+        z_freq =H_mmse_freq .* y_freq; 
+        dd_est_matrix = ifft2(z_freq);
 
         estimated_bits_stream=[];
         estimated_im_bits=[];estimated_qam_bits=[];
 
         % ... 此前的代码已经计算出了估计矩阵 dd_est_matrix ...
-
+        % H_lmmse=(heff*((H_eff*heff+(1/factor(i_snr))*Ie))^(-1));%平均snr每个符号的
         % 初始化一个空数组，用于存储在接收端检测出的比特流
         estimated_bits_stream = [];
 
-        % % --- A: 对中心数据区域进行检测 ---
+        % --- A: 对中心数据区域进行检测 ---
         % % 我们遍历发射端已知的网格结构，来检测传输的比特。
         % for row = data_rows
         %     for j = 1:num_groups_data
@@ -255,8 +275,8 @@ for i_snr=1:length(SNR)
         %     end
         % end
 
-        % --- A: 处理中央数据区域 ---
-        % 检测中央数据区域
+        % % --- A: 处理中央数据区域 ---
+        % % 检测中央数据区域
         for row = data_rows
             for j = 1:num_groups_data
                 start_col = (j - 1) * g + 1;
@@ -266,13 +286,15 @@ for i_snr=1:length(SNR)
                 im_bits_est = de2bi(detected_local_idx - 1, bits_per_IM_data, 'left-msb');
                 qam_bits_est = qamdemod(detected_symbol, cen_modu, 'UnitAveragePower', true, 'OutputType', 'bit');
                 estimated_bits_stream = [estimated_bits_stream, im_bits_est, qam_bits_est(:).'];
-                %
+
                 estimated_im_bits = [estimated_im_bits, im_bits_est];
                 estimated_qam_bits = [estimated_qam_bits, qam_bits_est(:).'];
             end
         end
-        len1=length(estimated_bits_stream);
-        [~,err1]=biterr(original_bits_stream(1:len1), estimated_bits_stream);
+        len1=length(estimated_bits_stream);%中央区域贡献的bit数量
+        [frame_cen_im_err(f),~]=biterr(original_im_bits(1:cen_im_num), estimated_im_bits);
+        % [err_cenqam,~]=biterr(estimated_qam_bits,original_qam_bits(cen_qam_num(f)));
+
 
         % --- B: 处理保护间隔区域 ---
         for row = guard_rows
@@ -283,7 +305,7 @@ for i_snr=1:length(SNR)
                     if current_group_size == g
                         global_col_indices = guard_cols_range(i_col : i_col + current_group_size - 1);
                         group_est = dd_est_matrix(row, global_col_indices) / scale_guard;
-                        [~, detected_local_idx] = max(abs(group_est));
+                        [~, detected_local_idx] = max(abs(group_est));%直接对最大的位置进行检测
                         detected_symbol = group_est(detected_local_idx);
                         im_bits_est = de2bi(detected_local_idx - 1, bits_per_IM_data, 'left-msb');
                         qam_bits_est = qamdemod(detected_symbol, guard_modu, 'UnitAveragePower', true, 'OutputType', 'bit');
@@ -308,32 +330,34 @@ for i_snr=1:length(SNR)
                 i_col = i_col + current_group_size;
             end
         end
-        [~,err2]=biterr(original_bits_stream(len1+1:length(estimated_bits_stream)), estimated_bits_stream(len1+1:length(estimated_bits_stream)));
+        % [~,err2]=biterr(original_bits_stream(len1+1:length(estimated_bits_stream)), estimated_bits_stream(len1+1:length(estimated_bits_stream)));
         %% 调试
-        % A=reshape(original_bits_stream(len1+1:length(estimated_bits_stream)),bit_row,[]);
-        % B=reshape(estimated_bits_stream(len1+1:length(estimated_bits_stream)),bit_row,[]);
-        % IM1=q1*(log2(guard_modu)+log2(nchoosek(g,1)));
-        % 
-        % [num1,~]=biterr(A(1:IM1,:),B(1:IM1,:));%正常调制
-        % [num2,~]=biterr(A(IM1+1:bit_row,:),B(IM1+1:bit_row,:));%独热编码
-      
-        %
+        % A=reshape(original_im_bits(369:length(original_im_bits)),13,[]);%保护间隔位置索引
+        % B=reshape(estimated_im_bits(369:length(estimated_im_bits)),13,[]);
+        % [guardim,~]=biterr(A(1:10,:),B(1:10,:));%正常调制
+        % [hotcode(f),~]=biterr(A(10+1:13,:),B(10+1:13,:));%独热编码
+
+
         [im_err_count, ~] = biterr(original_im_bits, estimated_im_bits);
         [qam_err_count, ~] = biterr(original_qam_bits, estimated_qam_bits);
-        frame_im_errors(f) = im_err_count;
-        frame_qam_errors(f) = qam_err_count;
+        frame_im_errors(f) = im_err_count;%im错误bit
+        frame_qam_errors(f) = qam_err_count;%qam错误bit
         frame_total_im_bits(f) = length(original_im_bits);
         frame_total_qam_bits(f) = length(original_qam_bits);
+        frame_guard_im_err(f)=frame_im_errors(f)-frame_cen_im_err(f);
 
-        [num_errors_this_frame, ~] = biterr(original_bits_stream, estimated_bits_stream);
-        num_bits_this_frame = length(original_bits_stream);
-        frame_errors(f) = num_errors_this_frame;
-        frame_bits(f) = num_bits_this_frame;
+        [num_errors_this_frame, ~] = biterr(original_bits_stream, estimated_bits_stream);%每一帧的错误数
+        num_bits_this_frame = length(original_bits_stream);%每一帧的bit数量
+        frame_errors(f) = num_errors_this_frame;%每一帧的错误bit数量
+        frame_bits(f) = num_bits_this_frame;%每一帧的bit数量（记录f次每次的，但是都是const）
 
+        
     end
     total_im_errors = sum(frame_im_errors);    total_qam_errors = sum(frame_qam_errors);
     total_im_bits = sum(frame_total_im_bits);    total_qam_bits = sum(frame_total_qam_bits);
     ber_im(i_snr) = total_im_errors / total_im_bits; ber_qam(i_snr) = total_qam_errors / total_qam_bits;
+    %计算im中央与边缘的ber
+    ber_cen_im(i_snr)=sum(frame_cen_im_err)/368/num_frames;   ber_guard_im(i_snr)=sum(frame_guard_im_err)/533/num_frames;
 
     total_bit_errors = sum(frame_errors);
     total_bits_transmitted = sum(frame_bits);

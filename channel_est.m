@@ -13,7 +13,7 @@ P=2;%路径数
 iter=100;
 nmse=zeros(1,iter);
 doppler_err=zeros(1,iter);delay_err=zeros(1,iter);h_err=zeros(1,iter);h_phi_err=zeros(1,iter);
-for nums=1:iter;
+for nums=1:iter
     nums
 li = randperm(l_max, P)';
 k = randi([-k_max,k_max],P,1);kv=randi([-5,5],P,1)*0.1;ki=k+kv;

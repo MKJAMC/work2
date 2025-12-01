@@ -277,7 +277,8 @@ for i_snr=1:length(SNR)
 
              % 2. 估计相位 (使用 r_refined 的相位)
              if abs(r_refined) > 1e-9 % 避免除以0
-                 h_phi_est_i = r_refined / abs(r_refined);
+                theta_est = exp(1j * 2 * pi * nu_opt * li_est(i) / (M*N));
+                h_phi_est_i = r_refined / abs(r_refined)/theta_est;
              else
                  h_phi_est_i = 1;
              end

@@ -1,5 +1,5 @@
 clc;clear;close all;
-
+%% 方案一
 M=64;
 N=32;
 fc=64e9;delta_f=120e3;
@@ -9,9 +9,7 @@ delay=[30,150,310,370,710,1090,1730,2510]*1e-9;
 delay_tap0=delay*M*delta_f;
 li=round(delay_tap0);
 doppler_max=fc*u_max/c;
-theta0= -pi + 2*pi*rand(1, length(delay));
-doppler=doppler_max*cos(theta0) ;
-ki=doppler*N*(1/delta_f);
+
 k_max0=doppler_max*N*(1/delta_f);
 
 % EVA信道，时延为0的路径是增益最大的，以后依次递减
@@ -19,11 +17,11 @@ h_p_db=[1.5,1.4,3.6,0.6,9.1,7,12,16.9];
 relative_power_linear = 10.^((-1) * h_p_db/10);%db转换为功率
 total_power = sum(relative_power_linear);
 h_p = relative_power_linear / total_power;%每一个增益所占据的百分比
-h_exp=exp( 1j*2 * pi * rand(1, length(h_p_db)));
+
 
 l_max=20;k_max=2;
 P=length(delay);%路径数
-modu=4;%BPSK
+modu=4;%QPSK
 %方案一数据个数
 ans1=(M-2*l_max-1)*N;
 %方案一速率
@@ -35,8 +33,8 @@ ans2=(M-2*l_max-1)*N+(N-4*k_max-1)*(2*l_max+1);
 
 %% 符号检测SNR
 SNR=10:2:16;
-iter=[4e4,4e4,4e5,4e6];
-% SNR=16;iter=[4e6];
+iter=[4e4,4e4,4e5,4e5];
+% SNR=18;iter=[4e6];
 power_persym=10.^(SNR/10);%每个符号的功率
 power=power_persym*ans2;%ans2为基准，求得总功率，方案二的功率为1
 factor0=power./ans1;%计算真正每个符号的能量
@@ -48,8 +46,13 @@ for i_snr=1:length(SNR)
     frame_errors = zeros(1, num_frames);
     frame_bits = zeros(1, num_frames);
     factor=factor0(i_snr);
-    for f=1:num_frames
+    parfor f=1:num_frames
         disp(f)
+        theta0= -pi + 2*pi*rand(1, length(delay));
+        doppler=doppler_max*cos(theta0) ;
+        ki=doppler*N*(1/delta_f);
+        h_exp=exp( 1j*2 * pi * rand(1, length(h_p_db)));
+
         %% 生成bit流
         bit_all = randi(modu,M,N)-ones(M,N); %DD域
         x = qammod(bit_all,modu,'UnitAveragePower',true);%调制后的信号的平均功率为 1，总能量/个数，能量为模长平方
@@ -68,7 +71,6 @@ for i_snr=1:length(SNR)
             end
         end
     
-
         hw=zeros(M,N);Y=zeros(M,N);
 
         %% 分数多普勒域下，DD域等效信道代码,发送数据和接受数据都是dd域

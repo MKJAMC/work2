@@ -31,11 +31,12 @@ bit= ans2*log2(modu);
 SNR=10:2:18;
 iter=[4e4,4e4,4e5,4e5,4e6];
 % SNR=18;iter=[4e5];
-
+chanel_err=zeros(1,length(SNR));
 power_persym = 10.^(SNR/10); % 每个符号的能量，考虑到高阶调制
 power=power_persym*ans2;%高阶调制后的全部符号能量
 factor=power./ans2;%计算真正每个符号的能量
 ber = zeros(1, length(SNR));
+xp=sqrt(power_persym(1)*1e5);%30dB是1e3
 
 for i_snr=1:length(SNR)
     ber_iter = zeros(1, iter(i_snr));%一个frame错误bit数
@@ -78,7 +79,7 @@ for i_snr=1:length(SNR)
                 dd(i,j)=0;
             end
         end
-
+        dd(1,1)=xp;
         hw=zeros(M,N);Y=zeros(M,N);
 
         %% 分数多普勒域下，DD域等效信道代码,发送数据和接受数据都是dd域
@@ -92,6 +93,8 @@ for i_snr=1:length(SNR)
             end
         end
         mag_hw = abs(hw);
+
+        % 频域相乘
         H_freq = fft2(hw);
         % 步骤 B: 对输入 dd 做二维傅里叶变换
         dd_freq = fft2(dd);
@@ -103,51 +106,125 @@ for i_snr=1:length(SNR)
         noise=reshape(noise,M,N);
         Y=y+noise;
         YABS=abs(Y);
+        [max_values0, max_indices0] = max(YABS, [], 2);%选出了每一行的最大值
 
+         %% 互相关信道估计
+        step=0.1;
+        yd=zeros(1,size(Y,2));%待抽取出的每一行
+        colnum=length(-k_max:step:k_max);%step细化以后的总列数
+        r=zeros(l_max+1,colnum);%相关值进行存放，行代表着带估计的时延位置，列代表着带估计的分数多普勒的位置
+        %计算每一条路径的相关位置
+        for l=1:l_max+1
+            jj=1; % <-- 我们定义了一个独立的计数器变量 jj
+            yd=Y(l,:);
+            for stepval=-k_max:step:k_max  % <-- 'stepval' 是这个循环的循环变量
+                for k=1:size(Y,2)
+                    r(l,jj)=r(l,jj)+yd(k)*conj(zeta_N(k-stepval-1,N));
+                end
+                jj=jj+1; % <-- 我们修改的是独立的计数器 jj，而不是循环变量 stepval
+            end
+        end
+        rabs=abs(r);
+        [max_values, max_indices] = max(rabs, [], 2);%选出了每一行的最大值
+        li_est = []; h_est=[];h_phi_est=[];ki_est=[];k_cor=[];temp=[];
+        [sorted_values, sorted_indices] = sort(max_values0(1:l_max+1), 'descend');
+        top_indices = sorted_indices(1:8);
+        li_est = sort(top_indices - 1);
 
-        %% H_eff等效信道
-        % y_vec = reshape(Y, M*N, 1);
-        % dd_vec = reshape(dd, M*N, 1);
-        % H_eff = zeros(M*N, M*N);
-        % for l = 0:M-1       % 遍历矩阵的行
-        %     for k = 0:N-1   % 遍历矩阵的列
-        %         % 计算 Y(l+1, k+1) 在列主序向量 y_vec 中的索引
-        %         row_idx = k*M + (l+1);
-        %         for l_prime = 0:M-1
-        %             for k_prime = 0:N-1
-        %                 % 计算 dd(l_prime+1, k_prime+1) 在列主序向量 dd_vec 中的索引
-        %                 col_idx = k_prime*M + (l_prime+1);
-        %                 h_l = mod(l - l_prime, M);
-        %                 h_k = mod(k - k_prime, N);
-        %                 H_eff(row_idx, col_idx) = hw(h_l + 1, h_k + 1);
-        %             end
-        %         end
-        %     end
-        % end
-        % noise=sqrt(1/2)*(randn(M*N,1)+1i*randn(M*N,1));%均值为0方差为1的高斯噪声
-        % y=H_eff*dd_vec+noise;
-        % yabs=reshape(abs(y),M,[]);
+        for i=1:length(li_est)
+            yd= Y(li_est(i)+1,:); % 选取正确的接收信号行
+            k_hat=(-k_max)+step*(max_indices(li_est(i)+1)-1);
+            k_cor=[k_cor,k_hat];
+            peak_idx = max_indices(li_est(i)+1); % 粗略搜索找到的峰值索引
+            % 确定边界索引，并处理边界 保证索引不越界 (例如峰值在第一个或最后一个点)
+            left_idx = max(1, peak_idx - 1);
+            right_idx = min(colnum, peak_idx + 1);
+            % 使用峰值点和它两边的点作为 GSS 的初始边界
+            b_l = (-k_max) + step * (left_idx - 1);
+            b_u = (-k_max) + step * (right_idx - 1);
+            max_iter=50;
+            eta = (sqrt(5)-1)/2;
+            % 在循环外计算初始的 b1 和 b2 以及它们的函数值
+            b1 = b_u - eta * (b_u - b_l);
+            b2 = b_l + eta * (b_u - b_l);
+            f1_val = 0;
+            for k=1:size(Y,2)
+                f1_val = f1_val + yd(k)*conj(zeta_N(k-b1-1,N));
+            end
+            f1_val = abs(f1_val); % 取模
 
+            f2_val = 0;
+            for k=1:size(Y,2)
+                f2_val = f2_val + yd(k)*conj(zeta_N(k-b2-1,N));
+            end
+            f2_val = abs(f2_val); % 取模
 
+            for iter_gss = 1:max_iter
+                if f1_val > f2_val
+                    b_u = b2;
+                    b2 = b1;
+                    f2_val = f1_val; % 无需重新计算 f2
+                    b1 = b_u - eta * (b_u - b_l);
+                    f1_val = 0;
+                    for k=1:size(Y,2)
+                        f1_val = f1_val + yd(k)*conj(zeta_N(k-b1-1,N));
+                    end
+                    f1_val = abs(f1_val); % 只需要计算一个新的 f1
+                else
+                    b_l = b1;
+                    b1 = b2;
+                    f1_val = f2_val; % 无需重新计算 f1
+                    b2 = b_l + eta * (b_u - b_l);
+                    f2_val = 0;
+                    for k=1:size(Y,2)
+                        f2_val = f2_val + yd(k)*conj(zeta_N(k-b2-1,N));
+                    end
+                    f2_val = abs(f2_val); % 只需要计算一个新的 f2
+                end
+            end
+            nu_opt = (b_l + b_u) / 2;
+            ki_est=[ki_est,nu_opt];
+            yd = Y(li_est(i)+1, :); % 获取当前路径所在行的接收信号
+            r_refined = 0;
+            for k=1:N
+                r_refined = r_refined + yd(k) * conj(zeta_N(k-nu_opt-1, N));
+            end
+            h_est_i = abs(r_refined) / (xp); % 注意这里是 xp 而不是 power_persym
+            h_est = [h_est, h_est_i];
 
+            % 2. 估计相位 (使用 r_refined 的相位)
+            if abs(r_refined) > 1e-9 % 避免除以0
+                h_phi_est_i = r_refined / abs(r_refined);
+            else
+                h_phi_est_i = 1;
+            end
+            h_phi_est = [h_phi_est, h_phi_est_i];
+        end
+
+        %% 估计的数值生成信道,NMSE
+        hw_est=zeros(M,N);
+        for l=0:M-1
+            for k=0:N-1
+                for i=1:P
+                    theta=exp(1j*2*pi*ki_est(i)*(li_est(i))/(M*N));
+                    delta_term = (l == li_est(i)); % 如果 l 等于 li(i)，则 delta 为 1,l是从0开始计算
+                    hw_est(l+1,k+1)=hw_est(l+1,k+1)+h_est(i)*h_phi_est(i)*delta_term*zeta_N(k-ki_est(i),N).*theta;
+                end
+            end
+        end
         %% MMSE 检测
-        % % H_lmmse = (H_eff' * H_eff + 1 * eye(size(H_eff, 2)))^(-1)* H_eff';
-        % heff=H_eff';
-        % Ie=eye(size(H_eff, 2));
-        % H_lmmse=(heff*((H_eff*heff+(1/factor(i_snr))*Ie))^(-1));
-        % dd_est_matrix=H_lmmse*y;
-        % dd_est_matrix= reshape(dd_est_matrix, M, []);
+       
         y_freq = fft2(Y); % y已经是矩阵形式，无需reshape
         alpha = 1 / factor(i_snr);
-        H_freq = fft2(hw);
+        H_freq = fft2(hw_est);
         H_mmse_freq = conj(H_freq) ./ (abs(H_freq).^2 + alpha);
         z_freq_initial = H_mmse_freq .* y_freq;
         dd_est_matrix = ifft2(z_freq_initial);
+
         % --- 步骤 5: 提取数据符号并解调 ---
         % 找到原始数据符号的位置 (排除保护带的0和导频Xp)
         data_indices = find(dd ~= 0 );
 
-      
         % 提取对应位置的恢复符号
         dd_est_vec = dd_est_matrix(data_indices);
         dd_vec=dd(data_indices);
@@ -164,35 +241,6 @@ for i_snr=1:length(SNR)
         num_bits_this_frame = length(bit_orig(:));
         frame_errors(f) = num_errors_this_frame;
         frame_bits(f) = num_bits_this_frame;
-        % num_errors_this_frame/num_bits_this_frame;
-
-        % % 2. 定义“中心数据块”区域并找到其索引
-        % data_mask = (dd ~= 0);
-        % center_block_mask = false(M, N);
-        % center_block_mask(l_max+2 : M-l_max, :) = true;
-        % center_indices = find(center_block_mask & data_mask);
-        % 
-        % % 3. 定义“边缘数据块”区域 (即顶部和底部的数据)并找到其索引
-        % % 注意：中心块的掩码取反，再和总数据掩码相与，即可得到所有边缘数据
-        % edge_indices = find(~center_block_mask & data_mask);
-        % 
-        % % 5. 提取并解调“中心块”数据
-        % dd_est_center = dd_est_matrix(center_indices);
-        % bit_orig_center = bit_all(center_indices);
-        % bit_est_center = qamdemod(dd_est_center./sqrt(factor(i_snr)), modu, 'UnitAveragePower', true);
-        % [num_errors_center, num_bits_center] = biterr(bit_orig_center(:), bit_est_center(:));
-        % frame_errors_center(f) = num_errors_center;
-        % frame_bits_center(f) = num_bits_center;   
-        % num_bits_center
-        % 
-        % % 6. 提取并解调“边缘块”数据
-        % dd_est_edge = dd_est_matrix(edge_indices);
-        % bit_orig_edge = bit_all(edge_indices);
-        % bit_est_edge = qamdemod(dd_est_edge./sqrt(factor(i_snr)), modu, 'UnitAveragePower', true);
-        % [num_errors_edge, num_bits_edge] = biterr(bit_orig_edge(:), bit_est_edge(:));
-        % frame_errors_edge(f) = num_errors_edge;
-        % frame_bits_edge(f) = num_bits_edge;
-        % num_bits_edge
         
     end
     total_bit_errors = sum(frame_errors);

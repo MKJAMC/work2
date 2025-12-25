@@ -72,7 +72,7 @@ for i_snr=1:length(SNR)
     % 3.4 计算幅度缩放因子 (幅度是功率的平方根)
     scale_central = sqrt(power_per_central_symbol);
     scale_guard = sqrt(power_per_guard_symbol);
-    parfor f=1:num_frames % <-- parfor loop starts here
+    for f=1:num_frames % <-- parfor loop starts here
         disp(f)
         theta0= -pi + 2*pi*rand(1, length(delay));
         doppler=doppler_max*cos(theta0) ;

@@ -7,6 +7,7 @@ u_max=120*1000/3600;c=3e8;
 %计算抽头
 delay=[30,150,310,370,710,1090,1730,2510]*1e-9;
 delay_tap0=delay*M*delta_f;
+delay_resolution=1/(M*delta_f);
 li=round(delay_tap0);
 doppler_max=fc*u_max/c;
 
@@ -80,7 +81,7 @@ for i_snr=1:length(SNR)
         for l=0:M-1
             for k=0:N-1
                 for i=1:P
-                    theta=exp(1j*2*pi*ki(i)*(li(i))/(M*N));
+                    theta=exp((-1j)*2*pi*ki(i)*(li(i))/(M*N));
                     delta_term = (l == li(i)); % 如果 l 等于 li(i)，则 delta 为 1
                     hw(l+1,k+1)=hw(l+1,k+1)+h_p(i)*h_exp(i)*delta_term*zeta_N(k-ki(i),N).*theta;
                     % hw(l+1,k+1)=hw(l+1,k+1)+delta_term*zeta_N(k-ki(i),N).*theta;
@@ -207,7 +208,7 @@ for i_snr=1:length(SNR)
 
             % 2. 估计相位 (使用 r_refined 的相位)
             if abs(r_refined) > 1e-9 % 避免除以0
-                theta_est = exp(1j * 2 * pi * nu_opt * li_est(i) / (M*N));
+                theta_est = exp(-1j * 2 * pi * nu_opt * li_est(i) / (M*N));
                 h_phi_est_i = r_refined / abs(r_refined)/theta_est;
             else
                 h_phi_est_i = 1;

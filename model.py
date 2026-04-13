@@ -270,9 +270,7 @@ class Universal_OTFS_Detector(nn.Module):
         delta_tau = torch.abs(self.tau_grid - tau_c)
         delta_tau = torch.min(delta_tau, self.M - delta_tau)
         mask_bool = (delta_nu <= window_size) & (delta_tau <= window_size)
-        mask = mask_bool.any(dim=1).float()
-        mask_vec = mask.view(B, -1, 1)
-        y_vec = y_complex.view(B, -1, 1) * mask_vec
+        mask = mask_bool.any(dim=1).float() # [B, M, N]
 
         ones_amp = torch.ones(B, P, 1, 1, device=device)
         zeros_ph = torch.zeros(B, P, 1, 1, device=device)
@@ -282,12 +280,29 @@ class Universal_OTFS_Detector(nn.Module):
         basis_params_flat = basis_params.view(B * P, 1, 4)
         x_tf_flat = x_tf_input[:, None, :, :].expand(B, P, self.M, self.N).reshape(B * P, self.M, self.N)
 
+        # 依然用 FFT 算出完整的波形 (因为频域乘法必须是完整维度)
         echo_split = self.physics_layer(basis_params_flat, x_tf_flat)
         echo_complex = torch.complex(echo_split[:, 0], echo_split[:, 1])
+        echo_complex = echo_complex.view(B, P, self.M, self.N)
 
-        echo_complex = echo_complex.view(B, P, -1)
-        A = echo_complex.transpose(1, 2) * mask_vec
-        A_H = A.conj().transpose(1, 2)
+        # =================================================================
+        # 🚀 物理先验截断 (Delay Truncation Optimization)
+        # 因为目标 delay < 10，我们只截取前 15 个 bin (留 5 个 bin 给旁瓣)
+        # =================================================================
+        M_trunc = 15
+        
+        # 裁剪掩码、接收信号、和基向量
+        mask_trunc = mask[:, :M_trunc, :]              # [B, 15, N]
+        mask_vec = mask_trunc.reshape(B, -1, 1)        # [B, 480, 1]
+        
+        y_trunc = y_complex[:, :M_trunc, :]            # [B, 15, N]
+        y_vec = y_trunc.reshape(B, -1, 1) * mask_vec   # [B, 480, 1]
+        
+        echo_trunc = echo_complex[:, :, :M_trunc, :]   # [B, P, 15, N]
+        
+        # 构建极速版 A 矩阵
+        A = echo_trunc.reshape(B, P, -1).transpose(1, 2) * mask_vec # [B, 480, P]
+        A_H = A.conj().transpose(1, 2)                              # [B, P, 480]
         Gram = torch.bmm(A_H, A)
 
         if P > 1:
@@ -324,11 +339,16 @@ class Universal_OTFS_Detector(nn.Module):
         RHS = torch.bmm(A_H, y_vec)
         h_opt = torch.linalg.solve(Gram_Reg, RHS)
 
-        h_opt_detached = h_opt.detach()
-        y_recon_flat_complex = torch.sum(echo_complex * h_opt_detached, dim=1)
+        h_opt_detached = h_opt.detach()                      # shape: [B, P, 1]
+        h_opt_4d = h_opt_detached.unsqueeze(-1)              # shape: [B, P, 1, 1]
+        
+        # 4D 完美相乘后沿 P(多径) 维度求和，得到全局重构回波
+        y_recon_complex_4d = torch.sum(echo_complex * h_opt_4d, dim=1) # shape: [B, M, N]
+        
+        # 分离实部和虚部
         y_recon_opt = torch.stack(
-            [y_recon_flat_complex.real, y_recon_flat_complex.imag], dim=1
-        ).view(B, 2, self.M, self.N)
+            [y_recon_complex_4d.real, y_recon_complex_4d.imag], dim=1
+        ) # shape: [B, 2, M, N]
 
         return h_opt.squeeze(-1), y_recon_opt
 
@@ -436,7 +456,7 @@ class Universal_OTFS_Detector(nn.Module):
         init = target_y.new_tensor([[p[:2] for p in points]])
         refined = self._adam_optimize(
             init, target_y, x_tf_input,
-            num_steps=40,            # 【核心修改 2】从 15 步暴增到 40 步！给它足够的时间汇聚
+            num_steps=30,            # 【核心修改 2】从 15 步暴增到 40 步！给它足够的时间汇聚
             lr=0.02,                 # 【核心修改 2】学习率翻 4 倍，赋予强大的拉扯力
             ls_update_every=2,
             early_stop_after=5,

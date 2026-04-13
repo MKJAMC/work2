@@ -1,0 +1,9 @@
+﻿.venv/
+__pycache__/
+data_h5/
+data_npy/
+test_results/
+debug_pos/
+*.pth
+*.png
+*.fig

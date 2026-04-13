@@ -156,7 +156,7 @@ class Universal_OTFS_Detector(nn.Module):
 
         return kept
 
-    def _gain_ratio_exceeds(self, points, ratio_thresh=5.0):
+    def _gain_ratio_exceeds(self, points, ratio_thresh=15.0):
         if len(points) <= 1:
             return False
         amps = [max(p[2], 1e-9) for p in points]
@@ -463,7 +463,85 @@ class Universal_OTFS_Detector(nn.Module):
             stop_thresh=5e-4,
         )
         return refined[0].tolist()
+    
+    def _active_fission_test(self, candidate_point, target_y, x_tf_input):
+        """
+        主动裂变探测 (极速降维 + 奥卡姆剃刀版)
+        核心逻辑：
+        1. 绝不盲目启动 Adam。先用无梯度的 Least Squares (LS) 进行极速探路。
+        2. 引入“奥卡姆剃刀”惩罚：如果双点模型不能带来 MSE 的【大幅度】下降，立刻退回单点，拒绝过拟合。
+        """
+        nu_c, tau_c = candidate_point[0], candidate_point[1]
 
+        # 1. 正常单点精修作为 Baseline (仅调用一次 Adam)
+        refined_single = self._single_refine(candidate_point, target_y, x_tf_input)
+        nu_r, tau_r = refined_single[0], refined_single[1]
+
+        # =====================================================================
+        # 极速探路阶段 (无梯度，纯矩阵运算，速度极快)
+        # 测试四种经典干涉裂变方向（主对角、副对角、水平、垂直）
+        # =====================================================================
+        offset = 0.35
+        
+        # 打包送入 LS 评估
+        pos_S = target_y.new_tensor([[[nu_r, tau_r]]])
+        
+        seeds = [
+            [[nu_r + offset, tau_r + offset], [nu_r - offset, tau_r - offset]], # 主对角
+            [[nu_r + offset, tau_r - offset], [nu_r - offset, tau_r + offset]], # 副对角
+            [[nu_r + offset, tau_r],          [nu_r - offset, tau_r]],          # 水平
+            [[nu_r, tau_r + offset],          [nu_r, tau_r - offset]]           # 垂直
+        ]
+
+        best_loss = float('inf')
+        best_seeds = None
+
+        with torch.no_grad():
+            # 测单点 Baseline 残差
+            _, y_recon_S = self.solve_least_squares_gain(target_y, x_tf_input, pos_S)
+            loss_S = F.mse_loss(y_recon_S, target_y).item()
+            best_loss = loss_S
+
+            # 遍历四种双点方向，寻找 MSE 最小的物理路径
+            for seed_pair in seeds:
+                pos_pair = target_y.new_tensor([seed_pair])
+                h_pair, y_recon_pair = self.solve_least_squares_gain(target_y, x_tf_input, pos_pair)
+                loss_pair = F.mse_loss(y_recon_pair, target_y).item()
+
+                # 快速幅值健康度检查：防止吸收噪声产生的畸形解
+                amp1, amp2 = h_pair[0, 0].abs().item(), h_pair[0, 1].abs().item()
+                if min(amp1, amp2) > 0.2 * max(amp1, amp2):
+                    if loss_pair < best_loss:
+                        best_loss = loss_pair
+                        best_seeds = seed_pair
+
+        # =====================================================================
+        # 奥卡姆剃刀拦截 (Early Exit) - 防治“幽灵峰”的核心
+        # =====================================================================
+        # 【核心判断】：如果裂变成 2 个点带来的 MSE 改善不到 15% 
+        # 说明它本质上就是单目标，2 个点只是在过拟合环境噪声
+        if best_seeds is None or loss_S == 0 or (loss_S - best_loss) / loss_S < 0.15:
+            return [refined_single] # 瞬间返回单点，拒绝分裂，省下海量 Adam 计算！
+
+        # =====================================================================
+        # 确认是隐藏双径，启动唯一一次定向 Adam 精修
+        # =====================================================================
+        init_pair = [
+            [best_seeds[0][0], best_seeds[0][1], 0, 0], 
+            [best_seeds[1][0], best_seeds[1][1], 0, 0]
+        ]
+        
+        # 只在这里对被证实的双径跑一次 Adam
+        refined_pair = self._joint_refine(init_pair, target_y, x_tf_input)
+
+        # 终审判决
+        amp1, amp2 = refined_pair[0][2], refined_pair[1][2]
+        dist = self._circular_distance(refined_pair[0], refined_pair[1])
+        if min(amp1, amp2) > 0.15 * max(amp1, amp2) and dist > 0.2:
+            return refined_pair
+        else:
+            return [refined_single]
+        
     # ---------------------------------------------------------------------
     # 用当前所有点做一次全局回代，更新每个点的 amp/phase，并得到新残差
     # ---------------------------------------------------------------------
@@ -495,14 +573,15 @@ class Universal_OTFS_Detector(nn.Module):
     # ---------------------------------------------------------------------
     # 主推理：按你描述的多目标流程
     # ---------------------------------------------------------------------
+    # 【终极完美版】: VarPro 前置去干扰 + T3专属物理微调 + 解除位置枷锁
     def inference(
         self,
         y_input,
         x_input,
         max_targets=12,
-        prob_threshold=0.05,
+        prob_threshold=0.03,
         close_bin_threshold=1.8,
-        stop_gain_ratio=5.0,
+        stop_gain_ratio=15.0,
     ):
         """
         多目标检测流程：
@@ -543,9 +622,9 @@ class Universal_OTFS_Detector(nn.Module):
                 # Step 2: 如果是第一个目标，直接单目标精修
                 # ----------------------------------------------------------
                 if len(groups) == 0:
-                    refined = self._single_refine(candidate, y_residual_b, x_tf_b)
+                    fission_points = self._active_fission_test(candidate, y_residual_b, x_tf_b)
                     groups.append({
-                        'points': [refined],
+                        'points': fission_points, # 可能是1个点，也可能是裂变后的2个点
                         'is_close_group': False
                     })
 
@@ -553,12 +632,13 @@ class Universal_OTFS_Detector(nn.Module):
                         y_orig_b, x_tf_b, groups
                     )
 
-                    accepted_count += 1
+                    accepted_count += len(fission_points) # 动态增加计数值
 
                     if self._gain_ratio_exceeds(all_points, stop_gain_ratio):
                         break
 
                     continue
+
 
                 # ----------------------------------------------------------
                 # Step 3: 判断与已有目标/集合的距离
@@ -567,22 +647,22 @@ class Universal_OTFS_Detector(nn.Module):
 
                 # 远：说明它是新单目标
                 if min_dist > close_bin_threshold:
-                    refined = self._single_refine(candidate, y_residual_b, x_tf_b)
+                    fission_points = self._active_fission_test(candidate, y_residual_b, x_tf_b)
                     groups.append({
-                        'points': [refined],
+                        'points': fission_points,
                         'is_close_group': False
                     })
 
                     _, y_residual_b, all_points = self._global_refit_and_update_residual(
                         y_orig_b, x_tf_b, groups
                     )
-
-                    accepted_count += 1
+                    accepted_count += len(fission_points)
 
                     if self._gain_ratio_exceeds(all_points, stop_gain_ratio):
                         break
 
                     continue
+
 
                 # ----------------------------------------------------------
                 # Step 4: 近目标：放入同一集合，暂不精修，先更新残差以供探针检测

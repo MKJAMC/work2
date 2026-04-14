@@ -187,20 +187,25 @@ class Universal_OTFS_Detector(nn.Module):
         candidate_point,
         group_points,
         close_dist_thresh=1.8,
-        weak_amp_ratio=0.6,
+        weak_amp_ratio=0.28,
     ):
-        """
-        若新候选点很靠近该近邻集合，但幅值明显偏弱，
-        则认为它更可能是该集合没有估准造成的伪目标，而不是新目标。
-        """
         if len(group_points) == 0:
             return False
 
         cand_amp = max(candidate_point[2], 1e-9)
         max_group_amp = max(max(p[2], 1e-9) for p in group_points)
-
         min_dist = min(self._circular_distance(candidate_point, p) for p in group_points)
 
+        # =======================================================
+        # 【新增：第一层防御】贴身极近区绞杀 (< 0.45 bin)
+        # 这么近的距离，如果能量不到主峰的 50%，绝对是畸变过拟合！
+        # =======================================================
+        if min_dist < 0.45 and cand_amp < max_group_amp * 0.50:
+            return True
+
+        # =======================================================
+        # 【原版：第二层防御】常规波纹拦截区 (< 1.8 bin)
+        # =======================================================
         if min_dist < close_dist_thresh and cand_amp < max_group_amp * weak_amp_ratio:
             return True
 
@@ -542,6 +547,27 @@ class Universal_OTFS_Detector(nn.Module):
         amp1, amp2 = refined_pair[0][2], refined_pair[1][2]
         dist = self._circular_distance(refined_pair[0], refined_pair[1])
         
+        min_a = min(amp1, amp2)
+        max_a = max(amp1, amp2)
+
+        # 【新增：阶梯式终审】
+        if dist <= 0.25:
+            return [refined_single] # 距离太近，强行打回
+            
+        elif dist < 0.45:
+            # 贴身极近距：必须具备 50% 能量才能被承认为隐藏双径
+            if min_a > 0.50 * max_a:
+                return refined_pair
+            else:
+                return [refined_single]
+                
+        else:
+            # 常规距离：维持 25% 的能量底线
+            if min_a > 0.25 * max_a:
+                return refined_pair
+            else:
+                return [refined_single]
+        
         # 【核心逻辑】：如果是模型自由度过高导致的单点过拟合（幽灵峰），
         # Adam 在收敛后，要么把两个点吸回单点（dist < 0.3），
         # 要么通过反相抵消把其中一个点的有效幅值降到极低（< 15%）。
@@ -776,8 +802,39 @@ class Universal_OTFS_Detector(nn.Module):
                     if max_gain / max(p[2], 1e-9) <= stop_gain_ratio:
                         filtered_points.append(p)
 
-                filtered_points = self._deduplicate_points(filtered_points, dist_thresh=0.25)
-                final_params_list[b] = filtered_points
+                # =========================================================
+                # 【全新的智能物理清道夫 (Smart Deduplication)】
+                # =========================================================
+                # 先按能量从大到小排序，确保强点优先保留，弱点必须接受强点的审视
+                filtered_points = sorted(filtered_points, key=lambda x: x[2], reverse=True)
+                final_kept = []
+                
+                for p in filtered_points:
+                    is_fake = False
+                    for kept_p in final_kept:
+                        dist = self._circular_distance(p, kept_p)
+                        
+                        # 规则1：绝对重合 (< 0.25 bin)，无论多大能量，直接吞噬
+                        if dist < 0.25:
+                            is_fake = True
+                            break
+                        # 规则2：贴身畸变区 (0.25 ~ 0.50 bin)
+                        # 如果你在强点旁边这么近，但能量连强点的 50% 都不到，你必是 Adam 拉扯出来的假波纹！
+                        elif dist < 0.50:
+                            if p[2] < 0.50 * kept_p[2]:
+                                is_fake = True
+                                break
+                        # 规则3：常规旁瓣区 (0.50 ~ 0.85 bin)
+                        # 如果距离稍远，但能量异常微弱（不到强点 25%），同样按旁瓣抹除
+                        elif dist < 0.85:
+                            if p[2] < 0.25 * kept_p[2]:
+                                is_fake = True
+                                break
+                                
+                    if not is_fake:
+                        final_kept.append(p)
+
+                final_params_list[b] = final_kept
             else:
                 final_params_list[b] = []
 

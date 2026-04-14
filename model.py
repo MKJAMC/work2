@@ -138,24 +138,8 @@ class Universal_OTFS_Detector(nn.Module):
         d_tau = min(d_tau, self.M - d_tau)
         return float(np.sqrt(d_nu ** 2 + d_tau ** 2))
 
-    def _deduplicate_points(self, points, dist_thresh=1.0):
-        if len(points) <= 1:
-            return points
 
-        points_sorted = sorted(points, key=lambda x: x[2], reverse=True)
-        kept = []
-
-        for p in points_sorted:
-            duplicate = False
-            for q in kept:
-                if self._circular_distance(p, q) < dist_thresh:
-                    duplicate = True
-                    break
-            if not duplicate:
-                kept.append(p)
-
-        return kept
-
+    #触发是否结束
     def _gain_ratio_exceeds(self, points, ratio_thresh=15.0):
         if len(points) <= 1:
             return False
@@ -213,6 +197,7 @@ class Universal_OTFS_Detector(nn.Module):
 
     # ---------------------------------------------------------------------
     # 从残差中找一个候选峰
+    # 将整数网格加上小数偏移量，得到高精度的连续坐标 rough_nu 和 rough_tau。这里的取余操作非常关键，它完美契合了 OTFS 信号在 Delay-Doppler 域特有的二维循环卷积物理边界条件（即目标从多普勒/时延一端出去，会从另一端绕回来）。
     # ---------------------------------------------------------------------
     def _find_peak_from_residual(self, y_residual, prob_threshold):
         device = y_residual.device
@@ -244,6 +229,7 @@ class Universal_OTFS_Detector(nn.Module):
             'prob': peak_val
         }
 
+    #从残差中估计最可能的点
     def _estimate_candidate_from_residual(self, y_residual, x_tf_input, prob_threshold):
         peak = self._find_peak_from_residual(y_residual, prob_threshold)
         if peak is None:
@@ -260,7 +246,7 @@ class Universal_OTFS_Detector(nn.Module):
         return [peak['nu'], peak['tau'], amp, phase]
 
     # ---------------------------------------------------------------------
-    # LS 求解
+    # LS 求解，在已知目标（或候选点）二维物理坐标（多普勒 $nu$、时延 $tau$）的前提下，利用发送信号 $X$ 和接收残差 $Y$，通过严格的物理方程推导出这几个目标到底具有多大的反射面（幅度 Amplitude）和经历了怎样的电磁波相移（相位 Phase）
     # ---------------------------------------------------------------------
     def solve_least_squares_gain(self, y_input, x_tf_input, est_pos, window_size=3):
         B, P, _ = est_pos.shape
@@ -329,7 +315,7 @@ class Universal_OTFS_Detector(nn.Module):
                 min_dist = torch.min(dist_matrix.view(B, -1), dim=1)[0]  # shape: [B]
                 
                 base_lambda = 1e-4
-                max_extra_lambda = 0.015  # 从 0.05 剧烈降低到 0.002
+                max_extra_lambda = 0.025  # 从 0.05 剧烈降低到 0.002
                 critical_dist = 0.8      
                 
                 boost_factor = torch.relu(critical_dist - min_dist) / critical_dist
@@ -522,13 +508,12 @@ class Universal_OTFS_Detector(nn.Module):
                         best_loss = loss_pair
                         best_seeds = seed_pair
 
-        # =====================================================================
-        # 奥卡姆剃刀初审 (Early Exit)
-        # =====================================================================
-        # 门限设为 5% (0.05)：足以拦截绝大多数纯噪声带来的微小 MSE 下降，
-        # 同时给位置尚未完全对齐的真实双径发放“准考证”，放行进入 Adam 检验。
-        if best_seeds is None or loss_S == 0 or (loss_S - best_loss) / loss_S < 0.05:
-            return [refined_single] # 瞬间返回单点，拒绝分裂，省下海量 Adam 计算！
+        # 【终极奥卡姆剃刀】：门限从 0.05 提升到 0.12
+        # 物理意义：想多用 4 个参数把一个峰劈成两个？可以！
+        # 但你必须证明这对残差有实质性的、超过 12% 的巨大改善。
+        # 否则你就是在“均分能量过拟合”，直接打回单点！
+        if best_seeds is None or loss_S == 0 or (loss_S - best_loss) / loss_S < 0.12:
+            return [refined_single]
 
         # =====================================================================
         # 确认疑似双径，启动唯一一次定向 Adam 精修
@@ -634,7 +619,7 @@ class Universal_OTFS_Detector(nn.Module):
 
         final_params_list = [[] for _ in range(B)]
 
-        for b in range(B):
+        for b in range(B):#对于batchsize中的每个样本进行处理
             y_orig_b = y_input[b:b+1]
             x_tf_b = X_TF_Global[b:b+1]
             y_residual_b = y_orig_b.clone()
@@ -656,7 +641,7 @@ class Universal_OTFS_Detector(nn.Module):
                 # Step 2: 如果是第一个目标，直接单目标精修
                 # ----------------------------------------------------------
                 if len(groups) == 0:
-                    fission_points = self._active_fission_test(candidate, y_residual_b, x_tf_b)
+                    fission_points = self._active_fission_test(candidate, y_residual_b, x_tf_b)# 主动裂变探测器
                     groups.append({
                         'points': fission_points, # 可能是1个点，也可能是裂变后的2个点
                         'is_close_group': False
@@ -726,11 +711,10 @@ class Universal_OTFS_Detector(nn.Module):
                 _, y_residual_b, all_points = self._global_refit_and_update_residual(
                     y_orig_b, x_tf_b, groups
                 )
-                accepted_count += 1
-                
+                accepted_count += 1          
 
                 
-
+                #还是基于近目标的情况下
                 # ----------------------------------------------------------
                 # Step 5: 探针 (Probe) 测试与策略分流 (核心修复区)
                 # ----------------------------------------------------------
@@ -802,8 +786,7 @@ class Universal_OTFS_Detector(nn.Module):
                     if max_gain / max(p[2], 1e-9) <= stop_gain_ratio:
                         filtered_points.append(p)
 
-                # =========================================================
-                # 【全新的智能物理清道夫 (Smart Deduplication)】
+                
                 # =========================================================
                 # 先按能量从大到小排序，确保强点优先保留，弱点必须接受强点的审视
                 filtered_points = sorted(filtered_points, key=lambda x: x[2], reverse=True)

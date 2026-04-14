@@ -324,7 +324,7 @@ class Universal_OTFS_Detector(nn.Module):
                 min_dist = torch.min(dist_matrix.view(B, -1), dim=1)[0]  # shape: [B]
                 
                 base_lambda = 1e-4
-                max_extra_lambda = 0.002  # 从 0.05 剧烈降低到 0.002
+                max_extra_lambda = 0.015  # 从 0.05 剧烈降低到 0.002
                 critical_dist = 0.8      
                 
                 boost_factor = torch.relu(critical_dist - min_dist) / critical_dist
@@ -410,7 +410,7 @@ class Universal_OTFS_Detector(nn.Module):
                             d_tau = torch.abs(params_pos[:, i, 1] - params_pos[:, j, 1])
                             d_tau = torch.min(d_tau, self.M - d_tau)
                             dist = torch.sqrt(d_nu ** 2 + d_tau ** 2 + 1e-8)
-                            repulsive_terms.append(F.relu(0.3 - dist))
+                            repulsive_terms.append(F.relu(0.15 - dist))
 
                     if len(repulsive_terms) > 0:
                         repulsive_penalty = torch.mean(torch.stack(repulsive_terms, dim=0))
@@ -457,19 +457,20 @@ class Universal_OTFS_Detector(nn.Module):
         refined = self._adam_optimize(
             init, target_y, x_tf_input,
             num_steps=30,            # 【核心修改 2】从 15 步暴增到 40 步！给它足够的时间汇聚
-            lr=0.02,                 # 【核心修改 2】学习率翻 4 倍，赋予强大的拉扯力
+            lr=0.01,                 # 【核心修改 2】学习率翻 4 倍，赋予强大的拉扯力
             ls_update_every=2,
-            early_stop_after=5,
+            early_stop_after=8,
             stop_thresh=5e-4,
         )
         return refined[0].tolist()
     
     def _active_fission_test(self, candidate_point, target_y, x_tf_input):
         """
-        主动裂变探测 (极速降维 + 奥卡姆剃刀版)
+        主动裂变探测 (极致灵敏 + 宽进严出版)
         核心逻辑：
         1. 绝不盲目启动 Adam。先用无梯度的 Least Squares (LS) 进行极速探路。
-        2. 引入“奥卡姆剃刀”惩罚：如果双点模型不能带来 MSE 的【大幅度】下降，立刻退回单点，拒绝过拟合。
+        2. 初审 (宽进)：允许 MSE 仅下降 5% 的双点模型通过，防止漏掉间距极近的真实目标。
+        3. 终审 (严出)：利用 Adam 物理推演，严酷绞杀距离小于 0.3 或幅值被榨干的过拟合单点。
         """
         nu_c, tau_c = candidate_point[0], candidate_point[1]
 
@@ -481,7 +482,8 @@ class Universal_OTFS_Detector(nn.Module):
         # 极速探路阶段 (无梯度，纯矩阵运算，速度极快)
         # 测试四种经典干涉裂变方向（主对角、副对角、水平、垂直）
         # =====================================================================
-        offset = 0.35
+        # 探路偏移量设为 0.25，生成的种子间距约为 0.5~0.7 bin，完美契合极近多径盲区
+        offset = 0.15
         
         # 打包送入 LS 评估
         pos_S = target_y.new_tensor([[[nu_r, tau_r]]])
@@ -508,39 +510,45 @@ class Universal_OTFS_Detector(nn.Module):
                 h_pair, y_recon_pair = self.solve_least_squares_gain(target_y, x_tf_input, pos_pair)
                 loss_pair = F.mse_loss(y_recon_pair, target_y).item()
 
-                # 快速幅值健康度检查：防止吸收噪声产生的畸形解
+                # 初审阶段幅值健康度检查：放宽至 0.05，因为静态位置未优化，允许出现轻微畸形
                 amp1, amp2 = h_pair[0, 0].abs().item(), h_pair[0, 1].abs().item()
-                if min(amp1, amp2) > 0.2 * max(amp1, amp2):
+                if min(amp1, amp2) > 0.05 * max(amp1, amp2):
                     if loss_pair < best_loss:
                         best_loss = loss_pair
                         best_seeds = seed_pair
 
         # =====================================================================
-        # 奥卡姆剃刀拦截 (Early Exit) - 防治“幽灵峰”的核心
+        # 奥卡姆剃刀初审 (Early Exit)
         # =====================================================================
-        # 【核心判断】：如果裂变成 2 个点带来的 MSE 改善不到 15% 
-        # 说明它本质上就是单目标，2 个点只是在过拟合环境噪声
-        if best_seeds is None or loss_S == 0 or (loss_S - best_loss) / loss_S < 0.15:
+        # 门限设为 5% (0.05)：足以拦截绝大多数纯噪声带来的微小 MSE 下降，
+        # 同时给位置尚未完全对齐的真实双径发放“准考证”，放行进入 Adam 检验。
+        if best_seeds is None or loss_S == 0 or (loss_S - best_loss) / loss_S < 0.05:
             return [refined_single] # 瞬间返回单点，拒绝分裂，省下海量 Adam 计算！
 
         # =====================================================================
-        # 确认是隐藏双径，启动唯一一次定向 Adam 精修
+        # 确认疑似双径，启动唯一一次定向 Adam 精修
         # =====================================================================
         init_pair = [
             [best_seeds[0][0], best_seeds[0][1], 0, 0], 
             [best_seeds[1][0], best_seeds[1][1], 0, 0]
         ]
         
-        # 只在这里对被证实的双径跑一次 Adam
+        # 只在这里对拿到“准考证”的双径跑一次 Adam
         refined_pair = self._joint_refine(init_pair, target_y, x_tf_input)
 
-        # 终审判决
+        # =====================================================================
+        # 终审判决 (极其严格的物理绞杀)
+        # =====================================================================
         amp1, amp2 = refined_pair[0][2], refined_pair[1][2]
         dist = self._circular_distance(refined_pair[0], refined_pair[1])
-        if min(amp1, amp2) > 0.15 * max(amp1, amp2) and dist > 0.2:
-            return refined_pair
+        
+        # 【核心逻辑】：如果是模型自由度过高导致的单点过拟合（幽灵峰），
+        # Adam 在收敛后，要么把两个点吸回单点（dist < 0.3），
+        # 要么通过反相抵消把其中一个点的有效幅值降到极低（< 15%）。
+        if min(amp1, amp2) > 0.25 * max(amp1, amp2) and dist > 0.25:
+            return refined_pair  # 经受住了 Adam 的终极考验，确认为隐藏双径！
         else:
-            return [refined_single]
+            return [refined_single] # 伪装被物理法则识破，打回单点！
         
     # ---------------------------------------------------------------------
     # 用当前所有点做一次全局回代，更新每个点的 amp/phase，并得到新残差
@@ -665,8 +673,26 @@ class Universal_OTFS_Detector(nn.Module):
 
 
                 # ----------------------------------------------------------
-                # Step 4: 近目标：放入同一集合，暂不精修，先更新残差以供探针检测
+                # Step 4: 近目标：拦截旁瓣 OR 放入集合
                 # ----------------------------------------------------------
+                # 【补上丢失的防御阵地：局部旁瓣拦截器】
+                unreasonable_cand = self._is_physically_unreasonable_candidate(
+                    candidate,
+                    groups[group_idx]['points'],
+                    close_dist_thresh=close_bin_threshold,
+                    weak_amp_ratio=0.28, # FA4 只有 18.6%，会被这里直接斩杀！T2 有 54%，安全通过！
+                )
+
+                if unreasonable_cand:
+                    # 发现旁瓣！拒绝加入集合。反手对现有集合做一次联合精修来消除波纹
+                    groups[group_idx]['points'] = self._joint_refine(groups[group_idx]['points'], y_orig_b, x_tf_b)
+                    _, y_residual_b, all_points = self._global_refit_and_update_residual(y_orig_b, x_tf_b, groups)
+                    
+                    if self._gain_ratio_exceeds(all_points, stop_gain_ratio):
+                        break
+                    continue 
+
+                # 如果真的是合法近距目标 (比如 T2)，才允许加入集合
                 groups[group_idx]['points'].append(candidate)
                 groups[group_idx]['is_close_group'] = True
 
@@ -675,6 +701,9 @@ class Universal_OTFS_Detector(nn.Module):
                     y_orig_b, x_tf_b, groups
                 )
                 accepted_count += 1
+                
+
+                
 
                 # ----------------------------------------------------------
                 # Step 5: 探针 (Probe) 测试与策略分流 (核心修复区)
@@ -689,7 +718,7 @@ class Universal_OTFS_Detector(nn.Module):
                         probe_candidate,
                         groups[group_idx]['points'],
                         close_dist_thresh=close_bin_threshold,
-                        weak_amp_ratio=0.6,
+                        weak_amp_ratio=0.75,
                     )
 
                     if unreasonable:
@@ -747,7 +776,7 @@ class Universal_OTFS_Detector(nn.Module):
                     if max_gain / max(p[2], 1e-9) <= stop_gain_ratio:
                         filtered_points.append(p)
 
-                filtered_points = self._deduplicate_points(filtered_points, dist_thresh=0.15)
+                filtered_points = self._deduplicate_points(filtered_points, dist_thresh=0.25)
                 final_params_list[b] = filtered_points
             else:
                 final_params_list[b] = []

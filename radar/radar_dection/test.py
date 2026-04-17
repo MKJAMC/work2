@@ -168,7 +168,7 @@ def compute_detection_and_rmse(est_params, gt_labels, det_threshold=1.0, rmse_th
 # =========================================================================
 # 3. 绘制检测结果 (带数值误差分析表格) -> 融合了 Train 的代码
 # =========================================================================
-def plot_detection_result(est_params, gt_labels, sample_idx, title_suffix="", save_dir='test_results'):
+def plot_detection_result(est_params, gt_labels, sample_idx, title_suffix="", save_dir='test_results_scatter'):
     os.makedirs(save_dir, exist_ok=True)
     
     est = est_params.cpu().numpy() if torch.is_tensor(est_params) else est_params.copy()
@@ -448,12 +448,21 @@ if __name__ == "__main__":
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor
     )
-    
+     
     all_metrics = []
     snr_rmse_data = [] 
     worst_by_exact_snr = {}
     best_by_exact_snr = {}
     samples_by_exact_snr = {}
+
+    # 仅统计 F1 != 1.0 的样本中，估计目标数与GT目标数的关系
+    non_perfect_est_more_count = 0
+    non_perfect_est_less_count = 0
+    non_perfect_est_equal_count = 0
+
+    # 记录 Delay / Doppler 误差最差样本（基于 RMSE 匹配结果）
+    worst_delay_sample = None
+    worst_doppler_sample = None
     
     sample_count = 0
     t_start = time.time()
@@ -474,9 +483,9 @@ if __name__ == "__main__":
             est_params, _, _ = model.inference(
                 y_in, x_in,
                 max_targets=6,
-                prob_threshold=0.05,
+                prob_threshold=0.04,
                 close_bin_threshold=1.8,
-                stop_gain_ratio=5.0,
+                stop_gain_ratio=7.0,
             )
                         
 
@@ -499,11 +508,58 @@ if __name__ == "__main__":
                     est_params_b, gt_labels_b, det_threshold=1.0, rmse_threshold=1.5
                 )
                 all_metrics.append(metrics)
+
+                # 统计：仅在 F1 != 1.0 时，比较估计样本数与GT样本数
+                if metrics['F1'] != 1.0:
+                    est_count_b = est_params_b.shape[0]
+                    gt_count_b = gt_labels_b.shape[0]
+                    if est_count_b > gt_count_b:
+                        non_perfect_est_more_count += 1
+                    elif est_count_b < gt_count_b:
+                        non_perfect_est_less_count += 1
+                    else:
+                        non_perfect_est_equal_count += 1
                 
                 if n_matched > 0:
                     snr_rmse_data.append({
                         'snr': snr_db, 'rmse_tau': rmse_tau, 'rmse_nu': rmse_nu, 'n_matched': n_matched
                     })
+
+                    # 更新最差 Delay RMSE 样本（bin 与 m）
+                    if np.isfinite(rmse_tau):
+                        rmse_tau_m = rmse_tau * distance_res
+                        if (worst_delay_sample is None) or (rmse_tau > worst_delay_sample['rmse_tau_bin']):
+                            worst_delay_sample = {
+                                'sample_idx': sample_count,
+                                'snr_db': snr_db,
+                                'f1': metrics['F1'],
+                                'tp': metrics['TP'],
+                                'fp': metrics['FP'],
+                                'fn': metrics['FN'],
+                                'est_count': int(est_params_b.shape[0]),
+                                'gt_count': int(gt_labels_b.shape[0]),
+                                'n_matched': int(n_matched),
+                                'rmse_tau_bin': float(rmse_tau),
+                                'rmse_tau_m': float(rmse_tau_m),
+                            }
+
+                    # 更新最差 Doppler RMSE 样本（bin 与 m/s）
+                    if np.isfinite(rmse_nu):
+                        rmse_nu_mps = rmse_nu * v_res
+                        if (worst_doppler_sample is None) or (rmse_nu > worst_doppler_sample['rmse_nu_bin']):
+                            worst_doppler_sample = {
+                                'sample_idx': sample_count,
+                                'snr_db': snr_db,
+                                'f1': metrics['F1'],
+                                'tp': metrics['TP'],
+                                'fp': metrics['FP'],
+                                'fn': metrics['FN'],
+                                'est_count': int(est_params_b.shape[0]),
+                                'gt_count': int(gt_labels_b.shape[0]),
+                                'n_matched': int(n_matched),
+                                'rmse_nu_bin': float(rmse_nu),
+                                'rmse_nu_mps': float(rmse_nu_mps),
+                            }
                 
                 est_params_b_np = est_params_b.detach().cpu().numpy() if torch.is_tensor(est_params_b) else est_params_b
                 gt_params_plot = gt_params_b_all.detach().cpu().numpy() if torch.is_tensor(gt_params_b_all) else gt_params_b_all.copy()
@@ -549,6 +605,38 @@ if __name__ == "__main__":
     perfect_count = len([m for m in all_metrics if m['F1'] == 1.0])
     print(f"\n🌟 **完美检测样本统计 (F1 = 1.0)**")
     print(f"  完全一致的样本数: {perfect_count} 个 (占比: {(perfect_count/sample_count)*100:.2f}%)")
+
+    non_perfect_count = sample_count - perfect_count
+    print(f"\n🔎 **非完美样本计数关系统计 (F1 != 1.0)**")
+    print(f"  非完美样本总数: {non_perfect_count} 个")
+    print(f"  估计数 > GT数 的样本数: {non_perfect_est_more_count} 个")
+    print(f"  估计数 < GT数 的样本数: {non_perfect_est_less_count} 个")
+    print(f"  估计数 = GT数 的样本数: {non_perfect_est_equal_count} 个")
+
+    print(f"\n⚠️ **Delay / Doppler 最差样本**")
+    if worst_delay_sample is not None:
+        print(
+            f"  [Worst Delay] sample={worst_delay_sample['sample_idx']}, "
+            f"SNR={worst_delay_sample['snr_db']:.2f}dB, F1={worst_delay_sample['f1']:.4f}, "
+            f"RMSE={worst_delay_sample['rmse_tau_bin']:.6f} bin ({worst_delay_sample['rmse_tau_m']:.6f} m), "
+            f"TP/FP/FN={worst_delay_sample['tp']}/{worst_delay_sample['fp']}/{worst_delay_sample['fn']}, "
+            f"K_est/K_gt={worst_delay_sample['est_count']}/{worst_delay_sample['gt_count']}, "
+            f"matched={worst_delay_sample['n_matched']}"
+        )
+    else:
+        print("  [Worst Delay] 无可用样本（可能没有任何匹配对）。")
+
+    if worst_doppler_sample is not None:
+        print(
+            f"  [Worst Doppler] sample={worst_doppler_sample['sample_idx']}, "
+            f"SNR={worst_doppler_sample['snr_db']:.2f}dB, F1={worst_doppler_sample['f1']:.4f}, "
+            f"RMSE={worst_doppler_sample['rmse_nu_bin']:.6f} bin ({worst_doppler_sample['rmse_nu_mps']:.6f} m/s), "
+            f"TP/FP/FN={worst_doppler_sample['tp']}/{worst_doppler_sample['fp']}/{worst_doppler_sample['fn']}, "
+            f"K_est/K_gt={worst_doppler_sample['est_count']}/{worst_doppler_sample['gt_count']}, "
+            f"matched={worst_doppler_sample['n_matched']}"
+        )
+    else:
+        print("  [Worst Doppler] 无可用样本（可能没有任何匹配对）。")
 
     # =========================================================================
     # 延后统一画图阶段 (高速无头渲染)

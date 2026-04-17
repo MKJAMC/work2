@@ -138,25 +138,9 @@ class Universal_OTFS_Detector(nn.Module):
         d_tau = min(d_tau, self.M - d_tau)
         return float(np.sqrt(d_nu ** 2 + d_tau ** 2))
 
-    def _deduplicate_points(self, points, dist_thresh=1.0):
-        if len(points) <= 1:
-            return points
 
-        points_sorted = sorted(points, key=lambda x: x[2], reverse=True)
-        kept = []
-
-        for p in points_sorted:
-            duplicate = False
-            for q in kept:
-                if self._circular_distance(p, q) < dist_thresh:
-                    duplicate = True
-                    break
-            if not duplicate:
-                kept.append(p)
-
-        return kept
-
-    def _gain_ratio_exceeds(self, points, ratio_thresh=5.0):
+    #触发是否结束
+    def _gain_ratio_exceeds(self, points, ratio_thresh=15.0):
         if len(points) <= 1:
             return False
         amps = [max(p[2], 1e-9) for p in points]
@@ -187,20 +171,25 @@ class Universal_OTFS_Detector(nn.Module):
         candidate_point,
         group_points,
         close_dist_thresh=1.8,
-        weak_amp_ratio=0.6,
+        weak_amp_ratio=0.28,
     ):
-        """
-        若新候选点很靠近该近邻集合，但幅值明显偏弱，
-        则认为它更可能是该集合没有估准造成的伪目标，而不是新目标。
-        """
         if len(group_points) == 0:
             return False
 
         cand_amp = max(candidate_point[2], 1e-9)
         max_group_amp = max(max(p[2], 1e-9) for p in group_points)
-
         min_dist = min(self._circular_distance(candidate_point, p) for p in group_points)
 
+        # =======================================================
+        # 【新增：第一层防御】贴身极近区绞杀 (< 0.45 bin)
+        # 这么近的距离，如果能量不到主峰的 50%，绝对是畸变过拟合！
+        # =======================================================
+        if min_dist < 0.45 and cand_amp < max_group_amp * 0.50:
+            return True
+
+        # =======================================================
+        # 【原版：第二层防御】常规波纹拦截区 (< 1.8 bin)
+        # =======================================================
         if min_dist < close_dist_thresh and cand_amp < max_group_amp * weak_amp_ratio:
             return True
 
@@ -208,6 +197,7 @@ class Universal_OTFS_Detector(nn.Module):
 
     # ---------------------------------------------------------------------
     # 从残差中找一个候选峰
+    # 将整数网格加上小数偏移量，得到高精度的连续坐标 rough_nu 和 rough_tau。这里的取余操作非常关键，它完美契合了 OTFS 信号在 Delay-Doppler 域特有的二维循环卷积物理边界条件（即目标从多普勒/时延一端出去，会从另一端绕回来）。
     # ---------------------------------------------------------------------
     def _find_peak_from_residual(self, y_residual, prob_threshold):
         device = y_residual.device
@@ -239,6 +229,7 @@ class Universal_OTFS_Detector(nn.Module):
             'prob': peak_val
         }
 
+    #从残差中估计最可能的点
     def _estimate_candidate_from_residual(self, y_residual, x_tf_input, prob_threshold):
         peak = self._find_peak_from_residual(y_residual, prob_threshold)
         if peak is None:
@@ -255,7 +246,7 @@ class Universal_OTFS_Detector(nn.Module):
         return [peak['nu'], peak['tau'], amp, phase]
 
     # ---------------------------------------------------------------------
-    # LS 求解
+    # LS 求解，在已知目标（或候选点）二维物理坐标（多普勒 $nu$、时延 $tau$）的前提下，利用发送信号 $X$ 和接收残差 $Y$，通过严格的物理方程推导出这几个目标到底具有多大的反射面（幅度 Amplitude）和经历了怎样的电磁波相移（相位 Phase）
     # ---------------------------------------------------------------------
     def solve_least_squares_gain(self, y_input, x_tf_input, est_pos, window_size=3):
         B, P, _ = est_pos.shape
@@ -270,9 +261,7 @@ class Universal_OTFS_Detector(nn.Module):
         delta_tau = torch.abs(self.tau_grid - tau_c)
         delta_tau = torch.min(delta_tau, self.M - delta_tau)
         mask_bool = (delta_nu <= window_size) & (delta_tau <= window_size)
-        mask = mask_bool.any(dim=1).float()
-        mask_vec = mask.view(B, -1, 1)
-        y_vec = y_complex.view(B, -1, 1) * mask_vec
+        mask = mask_bool.any(dim=1).float() # [B, M, N]
 
         ones_amp = torch.ones(B, P, 1, 1, device=device)
         zeros_ph = torch.zeros(B, P, 1, 1, device=device)
@@ -282,12 +271,29 @@ class Universal_OTFS_Detector(nn.Module):
         basis_params_flat = basis_params.view(B * P, 1, 4)
         x_tf_flat = x_tf_input[:, None, :, :].expand(B, P, self.M, self.N).reshape(B * P, self.M, self.N)
 
+        # 依然用 FFT 算出完整的波形 (因为频域乘法必须是完整维度)
         echo_split = self.physics_layer(basis_params_flat, x_tf_flat)
         echo_complex = torch.complex(echo_split[:, 0], echo_split[:, 1])
+        echo_complex = echo_complex.view(B, P, self.M, self.N)
 
-        echo_complex = echo_complex.view(B, P, -1)
-        A = echo_complex.transpose(1, 2) * mask_vec
-        A_H = A.conj().transpose(1, 2)
+        # =================================================================
+        # 🚀 物理先验截断 (Delay Truncation Optimization)
+        # 因为目标 delay < 10，我们只截取前 15 个 bin (留 5 个 bin 给旁瓣)
+        # =================================================================
+        M_trunc = 15
+        
+        # 裁剪掩码、接收信号、和基向量
+        mask_trunc = mask[:, :M_trunc, :]              # [B, 15, N]
+        mask_vec = mask_trunc.reshape(B, -1, 1)        # [B, 480, 1]
+        
+        y_trunc = y_complex[:, :M_trunc, :]            # [B, 15, N]
+        y_vec = y_trunc.reshape(B, -1, 1) * mask_vec   # [B, 480, 1]
+        
+        echo_trunc = echo_complex[:, :, :M_trunc, :]   # [B, P, 15, N]
+        
+        # 构建极速版 A 矩阵
+        A = echo_trunc.reshape(B, P, -1).transpose(1, 2) * mask_vec # [B, 480, P]
+        A_H = A.conj().transpose(1, 2)                              # [B, P, 480]
         Gram = torch.bmm(A_H, A)
 
         if P > 1:
@@ -309,11 +315,12 @@ class Universal_OTFS_Detector(nn.Module):
                 min_dist = torch.min(dist_matrix.view(B, -1), dim=1)[0]  # shape: [B]
                 
                 base_lambda = 1e-4
-                max_extra_lambda = 0.002  # 从 0.05 剧烈降低到 0.002
+                max_extra_lambda = 0.025  # 从 0.05 剧烈降低到 0.002
                 critical_dist = 0.8      
                 
                 boost_factor = torch.relu(critical_dist - min_dist) / critical_dist
                 dynamic_lambda = base_lambda + boost_factor * max_extra_lambda
+                
         else:
             dynamic_lambda = torch.ones(B, device=device) * 1e-4
 
@@ -324,11 +331,16 @@ class Universal_OTFS_Detector(nn.Module):
         RHS = torch.bmm(A_H, y_vec)
         h_opt = torch.linalg.solve(Gram_Reg, RHS)
 
-        h_opt_detached = h_opt.detach()
-        y_recon_flat_complex = torch.sum(echo_complex * h_opt_detached, dim=1)
+        h_opt_detached = h_opt.detach()                      # shape: [B, P, 1]
+        h_opt_4d = h_opt_detached.unsqueeze(-1)              # shape: [B, P, 1, 1]
+        
+        # 4D 完美相乘后沿 P(多径) 维度求和，得到全局重构回波
+        y_recon_complex_4d = torch.sum(echo_complex * h_opt_4d, dim=1) # shape: [B, M, N]
+        
+        # 分离实部和虚部
         y_recon_opt = torch.stack(
-            [y_recon_flat_complex.real, y_recon_flat_complex.imag], dim=1
-        ).view(B, 2, self.M, self.N)
+            [y_recon_complex_4d.real, y_recon_complex_4d.imag], dim=1
+        ) # shape: [B, 2, M, N]
 
         return h_opt.squeeze(-1), y_recon_opt
 
@@ -390,7 +402,7 @@ class Universal_OTFS_Detector(nn.Module):
                             d_tau = torch.abs(params_pos[:, i, 1] - params_pos[:, j, 1])
                             d_tau = torch.min(d_tau, self.M - d_tau)
                             dist = torch.sqrt(d_nu ** 2 + d_tau ** 2 + 1e-8)
-                            repulsive_terms.append(F.relu(0.3 - dist))
+                            repulsive_terms.append(F.relu(0.15 - dist))
 
                     if len(repulsive_terms) > 0:
                         repulsive_penalty = torch.mean(torch.stack(repulsive_terms, dim=0))
@@ -419,6 +431,7 @@ class Universal_OTFS_Detector(nn.Module):
                 final_params = torch.cat([params_pos, final_amp, final_phase], dim=-1)
 
         return final_params.detach()
+    
 
     def _single_refine(self, point, target_y, x_tf_input):
         init = target_y.new_tensor([[[point[0], point[1]]]])
@@ -431,19 +444,127 @@ class Universal_OTFS_Detector(nn.Module):
             stop_thresh=5e-4,
         )
         return refined[0, 0].tolist()
+    
+    
 
     def _joint_refine(self, points, target_y, x_tf_input):
         init = target_y.new_tensor([[p[:2] for p in points]])
         refined = self._adam_optimize(
             init, target_y, x_tf_input,
-            num_steps=40,            # 【核心修改 2】从 15 步暴增到 40 步！给它足够的时间汇聚
-            lr=0.02,                 # 【核心修改 2】学习率翻 4 倍，赋予强大的拉扯力
+            num_steps=30,            # 【核心修改 2】从 15 步暴增到 40 步！给它足够的时间汇聚
+            lr=0.01,                 # 【核心修改 2】学习率翻 4 倍，赋予强大的拉扯力
             ls_update_every=2,
-            early_stop_after=5,
+            early_stop_after=8,
             stop_thresh=5e-4,
         )
         return refined[0].tolist()
+    
+    def _active_fission_test(self, candidate_point, target_y, x_tf_input):
+        """
+        主动裂变探测 (极致灵敏 + 宽进严出版)
+        核心逻辑：
+        1. 绝不盲目启动 Adam。先用无梯度的 Least Squares (LS) 进行极速探路。
+        2. 初审 (宽进)：允许 MSE 仅下降 5% 的双点模型通过，防止漏掉间距极近的真实目标。
+        3. 终审 (严出)：利用 Adam 物理推演，严酷绞杀距离小于 0.3 或幅值被榨干的过拟合单点。
+        """
+        nu_c, tau_c = candidate_point[0], candidate_point[1]
 
+        # 1. 正常单点精修作为 Baseline (仅调用一次 Adam)
+        refined_single = self._single_refine(candidate_point, target_y, x_tf_input)
+        nu_r, tau_r = refined_single[0], refined_single[1]
+
+        # =====================================================================
+        # 极速探路阶段 (无梯度，纯矩阵运算，速度极快)
+        # 测试四种经典干涉裂变方向（主对角、副对角、水平、垂直）
+        # =====================================================================
+        # 探路偏移量设为 0.25，生成的种子间距约为 0.5~0.7 bin，完美契合极近多径盲区
+        offset = 0.15
+        
+        # 打包送入 LS 评估
+        pos_S = target_y.new_tensor([[[nu_r, tau_r]]])
+        
+        seeds = [
+            [[nu_r + offset, tau_r + offset], [nu_r - offset, tau_r - offset]], # 主对角
+            [[nu_r + offset, tau_r - offset], [nu_r - offset, tau_r + offset]], # 副对角
+            [[nu_r + offset, tau_r],          [nu_r - offset, tau_r]],          # 水平
+            [[nu_r, tau_r + offset],          [nu_r, tau_r - offset]]           # 垂直
+        ]
+
+        best_loss = float('inf')
+        best_seeds = None
+
+        with torch.no_grad():
+            # 测单点 Baseline 残差
+            _, y_recon_S = self.solve_least_squares_gain(target_y, x_tf_input, pos_S)
+            loss_S = F.mse_loss(y_recon_S, target_y).item()
+            best_loss = loss_S
+
+            # 遍历四种双点方向，寻找 MSE 最小的物理路径
+            for seed_pair in seeds:
+                pos_pair = target_y.new_tensor([seed_pair])
+                h_pair, y_recon_pair = self.solve_least_squares_gain(target_y, x_tf_input, pos_pair)
+                loss_pair = F.mse_loss(y_recon_pair, target_y).item()
+
+                # 初审阶段幅值健康度检查：放宽至 0.05，因为静态位置未优化，允许出现轻微畸形
+                amp1, amp2 = h_pair[0, 0].abs().item(), h_pair[0, 1].abs().item()
+                if min(amp1, amp2) > 0.05 * max(amp1, amp2):
+                    if loss_pair < best_loss:
+                        best_loss = loss_pair
+                        best_seeds = seed_pair
+
+        # 【终极奥卡姆剃刀】：门限从 0.05 提升到 0.12
+        # 物理意义：想多用 4 个参数把一个峰劈成两个？可以！
+        # 但你必须证明这对残差有实质性的、超过 12% 的巨大改善。
+        # 否则你就是在“均分能量过拟合”，直接打回单点！
+        if best_seeds is None or loss_S == 0 or (loss_S - best_loss) / loss_S < 0.12:
+            return [refined_single]
+
+        # =====================================================================
+        # 确认疑似双径，启动唯一一次定向 Adam 精修
+        # =====================================================================
+        init_pair = [
+            [best_seeds[0][0], best_seeds[0][1], 0, 0], 
+            [best_seeds[1][0], best_seeds[1][1], 0, 0]
+        ]
+        
+        # 只在这里对拿到“准考证”的双径跑一次 Adam
+        refined_pair = self._joint_refine(init_pair, target_y, x_tf_input)
+
+        # =====================================================================
+        # 终审判决 (极其严格的物理绞杀)
+        # =====================================================================
+        amp1, amp2 = refined_pair[0][2], refined_pair[1][2]
+        dist = self._circular_distance(refined_pair[0], refined_pair[1])
+        
+        min_a = min(amp1, amp2)
+        max_a = max(amp1, amp2)
+
+        # 【新增：阶梯式终审】
+        if dist <= 0.25:
+            return [refined_single] # 距离太近，强行打回
+            
+        elif dist < 0.45:
+            # 贴身极近距：必须具备 50% 能量才能被承认为隐藏双径
+            if min_a > 0.50 * max_a:
+                return refined_pair
+            else:
+                return [refined_single]
+                
+        else:
+            # 常规距离：维持 25% 的能量底线
+            if min_a > 0.25 * max_a:
+                return refined_pair
+            else:
+                return [refined_single]
+        
+        # 【核心逻辑】：如果是模型自由度过高导致的单点过拟合（幽灵峰），
+        # Adam 在收敛后，要么把两个点吸回单点（dist < 0.3），
+        # 要么通过反相抵消把其中一个点的有效幅值降到极低（< 15%）。
+        if min(amp1, amp2) > 0.25 * max(amp1, amp2) and dist > 0.25:
+            return refined_pair  # 经受住了 Adam 的终极考验，确认为隐藏双径！
+        else:
+            return [refined_single] # 伪装被物理法则识破，打回单点！
+        
     # ---------------------------------------------------------------------
     # 用当前所有点做一次全局回代，更新每个点的 amp/phase，并得到新残差
     # ---------------------------------------------------------------------
@@ -475,14 +596,15 @@ class Universal_OTFS_Detector(nn.Module):
     # ---------------------------------------------------------------------
     # 主推理：按你描述的多目标流程
     # ---------------------------------------------------------------------
+    # 【终极完美版】: VarPro 前置去干扰 + T3专属物理微调 + 解除位置枷锁
     def inference(
         self,
         y_input,
         x_input,
         max_targets=12,
-        prob_threshold=0.05,
+        prob_threshold=0.03,
         close_bin_threshold=1.8,
-        stop_gain_ratio=5.0,
+        stop_gain_ratio=15.0,
     ):
         """
         多目标检测流程：
@@ -501,7 +623,7 @@ class Universal_OTFS_Detector(nn.Module):
 
         final_params_list = [[] for _ in range(B)]
 
-        for b in range(B):
+        for b in range(B):#对于batchsize中的每个样本进行处理
             y_orig_b = y_input[b:b+1]
             x_tf_b = X_TF_Global[b:b+1]
             y_residual_b = y_orig_b.clone()
@@ -523,9 +645,9 @@ class Universal_OTFS_Detector(nn.Module):
                 # Step 2: 如果是第一个目标，直接单目标精修
                 # ----------------------------------------------------------
                 if len(groups) == 0:
-                    refined = self._single_refine(candidate, y_residual_b, x_tf_b)
+                    fission_points = self._active_fission_test(candidate, y_residual_b, x_tf_b)# 主动裂变探测器
                     groups.append({
-                        'points': [refined],
+                        'points': fission_points, # 可能是1个点，也可能是裂变后的2个点
                         'is_close_group': False
                     })
 
@@ -533,12 +655,13 @@ class Universal_OTFS_Detector(nn.Module):
                         y_orig_b, x_tf_b, groups
                     )
 
-                    accepted_count += 1
+                    accepted_count += len(fission_points) # 动态增加计数值
 
                     if self._gain_ratio_exceeds(all_points, stop_gain_ratio):
                         break
 
                     continue
+
 
                 # ----------------------------------------------------------
                 # Step 3: 判断与已有目标/集合的距离
@@ -547,26 +670,44 @@ class Universal_OTFS_Detector(nn.Module):
 
                 # 远：说明它是新单目标
                 if min_dist > close_bin_threshold:
-                    refined = self._single_refine(candidate, y_residual_b, x_tf_b)
+                    fission_points = self._active_fission_test(candidate, y_residual_b, x_tf_b)
                     groups.append({
-                        'points': [refined],
+                        'points': fission_points,
                         'is_close_group': False
                     })
 
                     _, y_residual_b, all_points = self._global_refit_and_update_residual(
                         y_orig_b, x_tf_b, groups
                     )
-
-                    accepted_count += 1
+                    accepted_count += len(fission_points)
 
                     if self._gain_ratio_exceeds(all_points, stop_gain_ratio):
                         break
 
                     continue
 
+
                 # ----------------------------------------------------------
-                # Step 4: 近目标：放入同一集合，暂不精修，先更新残差以供探针检测
+                # Step 4: 近目标：拦截旁瓣 OR 放入集合
                 # ----------------------------------------------------------
+                # 【补上丢失的防御阵地：局部旁瓣拦截器】
+                unreasonable_cand = self._is_physically_unreasonable_candidate(
+                    candidate,
+                    groups[group_idx]['points'],
+                    close_dist_thresh=close_bin_threshold,
+                    weak_amp_ratio=0.28, # FA4 只有 18.6%，会被这里直接斩杀！T2 有 54%，安全通过！
+                )
+
+                if unreasonable_cand:
+                    # 发现旁瓣！拒绝加入集合。反手对现有集合做一次联合精修来消除波纹
+                    groups[group_idx]['points'] = self._joint_refine(groups[group_idx]['points'], y_orig_b, x_tf_b)
+                    _, y_residual_b, all_points = self._global_refit_and_update_residual(y_orig_b, x_tf_b, groups)
+                    
+                    if self._gain_ratio_exceeds(all_points, stop_gain_ratio):
+                        break
+                    continue 
+
+                # 如果真的是合法近距目标 (比如 T2)，才允许加入集合
                 groups[group_idx]['points'].append(candidate)
                 groups[group_idx]['is_close_group'] = True
 
@@ -574,8 +715,10 @@ class Universal_OTFS_Detector(nn.Module):
                 _, y_residual_b, all_points = self._global_refit_and_update_residual(
                     y_orig_b, x_tf_b, groups
                 )
-                accepted_count += 1
+                accepted_count += 1          
 
+                
+                #还是基于近目标的情况下
                 # ----------------------------------------------------------
                 # Step 5: 探针 (Probe) 测试与策略分流 (核心修复区)
                 # ----------------------------------------------------------
@@ -589,7 +732,7 @@ class Universal_OTFS_Detector(nn.Module):
                         probe_candidate,
                         groups[group_idx]['points'],
                         close_dist_thresh=close_bin_threshold,
-                        weak_amp_ratio=0.6,
+                        weak_amp_ratio=0.75,
                     )
 
                     if unreasonable:
@@ -647,8 +790,38 @@ class Universal_OTFS_Detector(nn.Module):
                     if max_gain / max(p[2], 1e-9) <= stop_gain_ratio:
                         filtered_points.append(p)
 
-                filtered_points = self._deduplicate_points(filtered_points, dist_thresh=0.15)
-                final_params_list[b] = filtered_points
+                
+                # =========================================================
+                # 先按能量从大到小排序，确保强点优先保留，弱点必须接受强点的审视
+                filtered_points = sorted(filtered_points, key=lambda x: x[2], reverse=True)
+                final_kept = []
+                
+                for p in filtered_points:
+                    is_fake = False
+                    for kept_p in final_kept:
+                        dist = self._circular_distance(p, kept_p)
+                        
+                        # 规则1：绝对重合 (< 0.25 bin)，无论多大能量，直接吞噬
+                        if dist < 0.25:
+                            is_fake = True
+                            break
+                        # 规则2：贴身畸变区 (0.25 ~ 0.50 bin)
+                        # 如果你在强点旁边这么近，但能量连强点的 50% 都不到，你必是 Adam 拉扯出来的假波纹！
+                        elif dist < 0.50:
+                            if p[2] < 0.50 * kept_p[2]:
+                                is_fake = True
+                                break
+                        # 规则3：常规旁瓣区 (0.50 ~ 0.85 bin)
+                        # 如果距离稍远，但能量异常微弱（不到强点 25%），同样按旁瓣抹除
+                        elif dist < 0.85:
+                            if p[2] < 0.25 * kept_p[2]:
+                                is_fake = True
+                                break
+                                
+                    if not is_fake:
+                        final_kept.append(p)
+
+                final_params_list[b] = final_kept
             else:
                 final_params_list[b] = []
 

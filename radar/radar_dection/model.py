@@ -717,59 +717,12 @@ class Universal_OTFS_Detector(nn.Module):
                 )
                 accepted_count += 1          
 
-                
-                #还是基于近目标的情况下
-                # ----------------------------------------------------------
-                # Step 5: 探针 (Probe) 测试与策略分流 (核心修复区)
-                # ----------------------------------------------------------
-                probe_candidate = self._estimate_candidate_from_residual(
-                    y_residual_b, x_tf_b, prob_threshold
-                )
 
-                if probe_candidate is not None:
-                    # 判断这个探针是当前 group 估偏产生的伪峰，还是真实存在的新目标
-                    unreasonable = self._is_physically_unreasonable_candidate(
-                        probe_candidate,
-                        groups[group_idx]['points'],
-                        close_dist_thresh=close_bin_threshold,
-                        weak_amp_ratio=0.75,
-                    )
+                # 对近距集合做联合精修
+                refined_points = self._joint_refine(groups[group_idx]['points'], y_orig_b, x_tf_b)
+                groups[group_idx]['points'] = refined_points
 
-                    if unreasonable:
-                        # 【情况 A：发现伪峰】
-                        # 说明刚才的 group 估偏了 -> 立即对该 group 联合精修
-                        refined_points = self._joint_refine(groups[group_idx]['points'], y_orig_b, x_tf_b)
-                        groups[group_idx]['points'] = refined_points
-                        
-                    else:
-                        # 【情况 B：探针是有效的真目标】
-                        min_dist_probe, _ = self._find_nearest_group(probe_candidate, groups)
-                        
-                        if min_dist_probe > close_bin_threshold:
-                            # 按照你的思路：探针是离得远的真目标！
-                            # 1. 先对远目标进行单目标精修，并加入组群
-                            refined_far = self._single_refine(probe_candidate, y_residual_b, x_tf_b)
-                            groups.append({'points': [refined_far], 'is_close_group': False})
-                            accepted_count += 1
-                            
-                            # 2. 【核心回溯】再去对刚才那个没精修的 group 进行联合精修！
-                            # 此时远目标的干扰已被剥离，group 精修极其精准
-                            refined_group = self._joint_refine(groups[group_idx]['points'], y_orig_b, x_tf_b)
-                            groups[group_idx]['points'] = refined_group
-                        else:
-                            # 【核心修改 3】补全分支：探针是真目标，且离得很近 (比如罕见的紧密三径)
-                            groups[group_idx]['points'].append(probe_candidate)
-                            refined_group = self._joint_refine(groups[group_idx]['points'], y_orig_b, x_tf_b)
-                            groups[group_idx]['points'] = refined_group
-                            accepted_count += 1
-                            
-                else:
-                    # 【情况 C：没有新目标了 (残差干净)】
-                    # 但刚才放入的 group 还没被联合精修，必须在结束前补上这一步！
-                    refined_points = self._joint_refine(groups[group_idx]['points'], y_orig_b, x_tf_b)
-                    groups[group_idx]['points'] = refined_points
-
-                # 不管经历了哪种情况，最后统一做一次全局 LS 更新
+                # 全局 LS 更新
                 _, y_residual_b, all_points = self._global_refit_and_update_residual(
                     y_orig_b, x_tf_b, groups
                 )

@@ -113,7 +113,7 @@ for i_snr=1:length(SNR)
 
         % --- B: 处理保护间隔区域 (使用独热编码, g = 组大小) ---
         guard_rows = [1:(l_max + 1), (M - l_max + 1):M];
-        guard_cols_range = (2 * k_max + 2):(N - 2 * k_max);
+        guard_cols_range = (2 * k_max + 2):N;
         num_guard_cols = length(guard_cols_range);%需要索引调制的保护间隔部分
 
         % 遍历每一个指定的保护行

@@ -680,3 +680,4 @@ if __name__ == "__main__":
         
     print(f"✅ 所有图像渲染完毕，保存在 test_results/ 目录下！")
     print(f"总耗时: {time.time() - t_start:.2f} 秒")
+

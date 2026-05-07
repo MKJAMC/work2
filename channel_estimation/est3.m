@@ -37,8 +37,9 @@ ans3=cen_num+bit_row_num;
 bit=(log2(cen_modu)+log2(nchoosek(g,1)))*(cen_num)+(2*l_max+1)*bit_row;
 
 %% 信道检测
-SNR = 10:2:18;
+SNR = 10:2:18;% 方案二中
 % SNR=16:2:22;
+% SNR=18;
 iter=[2000,2000,2000,2000,2e3,2e3];
 power_persym=10.^(SNR/10);%每个符号的功率
 xp=sqrt(power_persym(1)*1e5);
@@ -69,7 +70,7 @@ for i_snr=1:length(SNR)
     scale_central = sqrt(power_per_central_symbol);
     scale_guard   = sqrt(power_per_guard_symbol);
 
-    parfor nums=1:iter(i_snr)%每次都重新生成信道
+    for nums=1:iter(i_snr)%每次都重新生成信道
         theta0= -pi + 2*pi*rand(1, length(delay));
         doppler=doppler_max*cos(theta0) ;
         ki=doppler*N*(1/delta_f);
@@ -284,14 +285,16 @@ for i_snr=1:length(SNR)
              end
              h_phi_est = [h_phi_est, h_phi_est_i];
          end
-        % disp(['不同路径的时延=',num2str(li)]);
-        % disp(['不同路径的多普勒=',num2str(ki)]);
-        % disp(['不同路径的信道增益=',num2str(h_p)]);
-        % disp(['不同路径的信道增益相位=',num2str(h_exp)]);
-        % disp(['估计的时延抽头=',num2str(li_est)]);
-        % disp(['估计的多普勒抽头=',num2str(ki_est)]);
-        % disp(['估计的信道增益=',num2str(h_est)]);
-        % disp(['估计的信道相位=',num2str(h_phi_est)]);
+        disp(['不同路径的时延=',num2str(li)]);
+        disp(['不同路径的多普勒=',num2str(ki)]);
+        disp(['不同路径的信道增益=',num2str(h_p)]);
+        disp(['不同路径的信道增益相位=',num2str(h_exp)]);
+        disp(['估计的时延抽头=',num2str(li_est.')]);
+        disp(['估计的多普勒抽头=',num2str(ki_est)]);
+        disp(['估计的信道增益=',num2str(h_est)]);
+        disp(['估计的信道相位=',num2str(h_phi_est)]);
+        ki_est-ki
+        dop_mean=mean(ki_est-ki)
         %% 估计的数值生成信道,NMSE
         hw_est=zeros(M,N);
         for l=0:M-1

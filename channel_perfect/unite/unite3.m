@@ -1,5 +1,6 @@
 %% 索引比特的进阶检测方法
 clc;clear;close all;
+
 M=64;
 N=32;
 fc=64e9;delta_f=120e3;
@@ -23,10 +24,11 @@ guard_modu= 4;
 bits_per_qam_symbol = log2(cen_modu);
 bits_per_guard_symbol=log2(guard_modu);
 g = 4; % IM分组参数
-guard_data_power_factor =0.5;
+guard_data_power_factor =1;
 
 % 速率=位置信息+调制阶数
 mo=mod((N-4*k_max-1),g);
+mo=0;
 q1 = floor((N-4*k_max-1)/ g);
 %一行的速率与绿色区间激活个数
 bit_row=(log2(guard_modu)+mo)+q1*(log2(guard_modu)+log2(nchoosek(g,1)));%guard一行bit数
@@ -37,11 +39,11 @@ bit=(log2(cen_modu)+log2(nchoosek(g,1)))*(cen_num)+(2*l_max+1)*bit_row;
 % 符号检测SNR
 SNR=10:2:18;
 iter=[4e4,4e4,4e5,4e5,4e6];
-% SNR=18;iter=[4e6];
+
+% SNR=12;iter=[4e6];
 cen_constellation = qammod(0:cen_modu-1, cen_modu, 'UnitAveragePower', true);
 guard_constellation = qammod(0:guard_modu-1, guard_modu, 'UnitAveragePower', true);
 %% 调试
-% SNR=16;iter=4e6;
 power_persym=10.^(SNR/10);%每个符号的功率
 ans2=(M-2*l_max-1)*N+(N-4*k_max-1)*(2*l_max+1);
 power=power_persym*ans2;%ans2为基准，求得总功率，方案二的功率为1

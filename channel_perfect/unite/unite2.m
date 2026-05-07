@@ -43,7 +43,7 @@ for i_snr=1:length(SNR)
     num_frames =ceil(iter(i_snr)/bit);
     frame_errors = zeros(1, num_frames);
     frame_bits = zeros(1, num_frames);
-    parfor f=1:num_frames
+    for f=1:num_frames
         disp(f)
         theta0= -pi + 2*pi*rand(1, length(delay));
         doppler=doppler_max*cos(theta0) ;

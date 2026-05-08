@@ -4,6 +4,8 @@ data_h5/
 data_npy/
 test_results/
 debug_pos/
+radar/data/
+radar/oldnet/
 *.pth
 *.png
 *.fig
